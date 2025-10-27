@@ -1,36 +1,57 @@
-import cv2
+import os
+import requests
+from datetime import datetime
+from openai import OpenAI
+import base64
 
-# ✅ 指定设备路径而不是 index，避免 OpenCV 混乱
-cap1 = cv2.VideoCapture("/dev/video0", cv2.CAP_V4L2)
-cap2 = cv2.VideoCapture("/dev/video2", cv2.CAP_V4L2)
+# 读取本地图片文件并转换为base64
+def encode_image(image_path):
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
 
-# ✅ 注意这里区分格式
-# Jetson 上某些 UVC 摄像头 MJPG 不稳定，可以尝试切换格式顺序
-cap1.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-cap2.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG')) 
-cap1.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap1.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
-cap1.set(cv2.CAP_PROP_FPS, 30)
-cap2.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
-cap2.set(cv2.CAP_PROP_FPS, 30)
-while True:
-    ret1, frame1 = cap1.read()
-    ret2, frame2 = cap2.read()
+# 初始化OpenAI客户端（兼容方舟API）
+client = OpenAI( 
+    base_url="https://ark.cn-beijing.volces.com/api/v3", 
+    api_key="0b02eee6-5201-46c3-95a8-59594aa6dc38",  # 直接使用API密钥或从环境变量读取
+) 
 
-    if not ret1:
-        print("❌ Error reading frame from cam1 (/dev/video0)")
-        break
-    if not ret2:
-        print("❌ Error reading frame from cam2 (/dev/video2)")
-        break
+# 生成图片
+imagesResponse = client.images.generate( 
+    model="doubao-seedream-4-0-250828", 
+    prompt="保留画面主体的姿态，将图片风格转化为动漫风格，但不要改变人物的五官神态，要能在动漫风格的图片看的出来主角真人的特点和神态！",
+    size="2K",
+    response_format="url",
+    extra_body = {
+        "image": f"data:image/jpeg;base64,{encode_image('./test.jpg')}",
+        "watermark": True
+    }
+) 
 
-    cv2.imshow("cam1", frame1)
-    cv2.imshow("cam2", frame2)
+# 创建保存图片的目录
+save_dir = "check_in_perpole"
+if not os.path.exists(save_dir):
+    os.makedirs(save_dir)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+# 下载并保存图片
+print(f"图片URL: {imagesResponse.data[0].url}")
 
-cap1.release()
-cap2.release()
-cv2.destroyAllWindows()
+try:
+    # 下载图片
+    response = requests.get(imagesResponse.data[0].url)
+    response.raise_for_status()
+    
+    # 生成文件名（包含时间戳）
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"generated_image_{timestamp}.jpg"
+    filepath = os.path.join(save_dir, filename)
+    
+    # 保存图片到本地
+    with open(filepath, 'wb') as f:
+        f.write(response.content)
+    
+    print(f"✓ 图片已保存到: {filepath}")
+    
+except requests.exceptions.RequestException as e:
+    print(f"✗ 下载图片失败: {e}")
+except Exception as e:
+    print(f"✗ 保存图片时出错: {e}")

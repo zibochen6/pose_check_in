@@ -6,9 +6,6 @@ import os
 from datetime import datetime
 from config import *
 import mediapipe as mp
-import requests
-import base64
-from openai import OpenAI
 
 # 加载YOLO姿态估计模型
 model = YOLO(MODEL_PATH,task="pose")  # 使用TensorRT引擎文件
@@ -21,17 +18,6 @@ hands_detector = mp_hands.Hands(
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 )
-
-# 初始化OpenAI客户端（用于图片风格化）
-openai_client = OpenAI(
-    base_url="https://ark.cn-beijing.volces.com/api/v3",
-    api_key="0b02eee6-5201-46c3-95a8-59594aa6dc38",
-)
-
-def encode_image_to_base64(image):
-    """将OpenCV图像转换为base64字符串"""
-    _, buffer = cv2.imencode('.jpg', image)
-    return base64.b64encode(buffer).decode('utf-8')
 
 # 加载状态图标
 red_icon = cv2.imread("icon/red.png", cv2.IMREAD_UNCHANGED)
@@ -238,85 +224,310 @@ def detect_hands(image):
     
     return hands_data
 
-def generate_anime_style_image(person_image_base64):
-    """调用AI生成动漫风格图片"""
-    try:
-        # 生成图片
-        images_response = openai_client.images.generate(
-            model="doubao-seedream-4-0-250828",
-            prompt="保留画面主体的姿态，将图片风格转化为动漫风格，但不要改变人物的五官神态，要能在动漫风格的图片看的出来主角真人的特点和神态！",
-            size="2K",
-            response_format="url",
-            extra_body={
-                "image": f"data:image/jpeg;base64,{person_image_base64}",
-                "watermark": True
-            }
-        )
-        return images_response.data[0].url
-    except Exception as e:
-        print(f"生成动漫风格图片失败: {e}")
-        return None
-
-def show_photo_and_anime_image(frame, person_bbox, current_keypoints):
-    """显示拍照的照片并生成动漫风格图片"""
-    # 记录开始时间
-    start_time = time.time()
+def draw_stickman_with_hands(keypoints, hands_data, canvas_width=500, canvas_height=700):
+    """根据关键点和手部数据在白色画布上绘制完整的火柴人"""
+    # 先绘制基础火柴人
+    canvas = draw_stickman(keypoints, canvas_width, canvas_height)
     
+    if not hands_data:
+        return canvas
+    
+    # 找到关键点的边界来进行缩放和居中（与draw_stickman保持一致）
+    valid_points = []
+    for x, y, conf in keypoints:
+        if conf > 0.3:
+            valid_points.append((x, y))
+    
+    if len(valid_points) == 0:
+        return canvas
+    
+    # 计算关键点的边界
+    x_coords = [p[0] for p in valid_points]
+    y_coords = [p[1] for p in valid_points]
+    x_min, x_max = min(x_coords), max(x_coords)
+    y_min, y_max = min(y_coords), max(y_coords)
+    
+    # 计算缩放比例，保持纵横比
+    person_width = x_max - x_min
+    person_height = y_max - y_min
+    
+    scale_x = (canvas_width * 0.7) / person_width if person_width > 0 else 1
+    scale_y = (canvas_height * 0.7) / person_height if person_height > 0 else 1
+    scale = min(scale_x, scale_y)
+    
+    # 计算偏移，使火柴人居中
+    offset_x = (canvas_width - person_width * scale) / 2 - x_min * scale
+    offset_y = (canvas_height - person_height * scale) / 2 - y_min * scale
+    
+    # 转换手部关键点坐标到画布坐标
+    def transform_hand_point(x, y):
+        # 手部坐标是归一化的(0-1)，需要转换到画布坐标系统
+        new_x = int(x * frame_width * scale + offset_x)
+        new_y = int(y * frame_height * scale + offset_y)
+        return (new_x, new_y)
+    
+    # MediaPipe手部关键点连接关系
+    hand_connections = [
+        # 拇指
+        [0, 1], [1, 2], [2, 3], [3, 4],
+        # 食指
+        [0, 5], [5, 6], [6, 7], [7, 8],
+        # 中指
+        [0, 9], [9, 10], [10, 11], [11, 12],
+        # 无名指
+        [0, 13], [13, 14], [14, 15], [15, 16],
+        # 小指
+        [0, 17], [17, 18], [18, 19], [19, 20],
+        # 手掌
+        [5, 9], [9, 13], [13, 17]
+    ]
+    
+    # 定义颜色方案（与身体一致）
+    body_color = (50, 50, 50)  # 深灰色（与身体骨架一致）
+    joint_color = (100, 150, 255)  # 浅蓝色关节（与身体关节一致）
+    
+    # 定义手指线条粗细
+    finger_thickness = {
+        'palm': 4,        # 手掌主线
+        'thumb': 3,       # 拇指
+        'finger': 3,      # 其他手指
+        'connection': 4   # 手掌连接线
+    }
+    
+    for hand in hands_data:
+        landmarks = hand['landmarks']
+        
+        # 首先绘制手掌连接线（更粗）
+        palm_connections = [[5, 9], [9, 13], [13, 17], [0, 5], [0, 17]]
+        for connection in palm_connections:
+            pt1_idx, pt2_idx = connection
+            if pt1_idx < len(landmarks) and pt2_idx < len(landmarks):
+                pt1 = transform_hand_point(landmarks[pt1_idx][0], landmarks[pt1_idx][1])
+                pt2 = transform_hand_point(landmarks[pt2_idx][0], landmarks[pt2_idx][1])
+                
+                if (0 <= pt1[0] < canvas_width and 0 <= pt1[1] < canvas_height and
+                    0 <= pt2[0] < canvas_width and 0 <= pt2[1] < canvas_height):
+                    cv2.line(canvas, pt1, pt2, body_color, finger_thickness['palm'])
+        
+        # 绘制五根手指（分别设置粗细）
+        finger_groups = [
+            ([0, 1, 2, 3, 4], finger_thickness['thumb']),     # 拇指
+            ([5, 6, 7, 8], finger_thickness['finger']),        # 食指
+            ([9, 10, 11, 12], finger_thickness['finger']),     # 中指
+            ([13, 14, 15, 16], finger_thickness['finger']),    # 无名指
+            ([17, 18, 19, 20], finger_thickness['finger'])     # 小指
+        ]
+        
+        for finger, thickness in finger_groups:
+            for i in range(len(finger) - 1):
+                pt1_idx = finger[i]
+                pt2_idx = finger[i + 1]
+                if pt1_idx < len(landmarks) and pt2_idx < len(landmarks):
+                    pt1 = transform_hand_point(landmarks[pt1_idx][0], landmarks[pt1_idx][1])
+                    pt2 = transform_hand_point(landmarks[pt2_idx][0], landmarks[pt2_idx][1])
+                    
+                    if (0 <= pt1[0] < canvas_width and 0 <= pt1[1] < canvas_height and
+                        0 <= pt2[0] < canvas_width and 0 <= pt2[1] < canvas_height):
+                        cv2.line(canvas, pt1, pt2, body_color, thickness)
+        
+        # 绘制手部关节点（与身体关节风格一致）
+        important_joints = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        for i in important_joints:
+            if i < len(landmarks):
+                pt = transform_hand_point(landmarks[i][0], landmarks[i][1])
+                if 0 <= pt[0] < canvas_width and 0 <= pt[1] < canvas_height:
+                    # 手腕和指尖稍大，其他关节较小
+                    if i in [0, 4, 8, 12, 16, 20]:  # 手腕和5个指尖
+                        radius = 6
+                    else:  # 其他关节
+                        radius = 5
+                    cv2.circle(canvas, pt, radius, joint_color, -1)
+                    cv2.circle(canvas, pt, radius, body_color, 2)
+    
+    return canvas
+
+def draw_stickman(keypoints, canvas_width=500, canvas_height=700):
+    """根据关键点在白色画布上绘制美观的火柴人"""
+    # 创建白色画布
+    canvas = np.ones((canvas_height, canvas_width, 3), dtype=np.uint8) * 255
+    
+    # 找到关键点的边界来进行缩放和居中
+    valid_points = []
+    for x, y, conf in keypoints:
+        if conf > 0.3:  # 降低阈值以获取更多关键点
+            valid_points.append((x, y))
+    
+    if len(valid_points) == 0:
+        return canvas
+    
+    # 计算关键点的边界
+    x_coords = [p[0] for p in valid_points]
+    y_coords = [p[1] for p in valid_points]
+    x_min, x_max = min(x_coords), max(x_coords)
+    y_min, y_max = min(y_coords), max(y_coords)
+    
+    # 计算缩放比例，保持纵横比
+    person_width = x_max - x_min
+    person_height = y_max - y_min
+    
+    scale_x = (canvas_width * 0.7) / person_width if person_width > 0 else 1
+    scale_y = (canvas_height * 0.7) / person_height if person_height > 0 else 1
+    scale = min(scale_x, scale_y)
+    
+    # 计算偏移，使火柴人居中
+    offset_x = (canvas_width - person_width * scale) / 2 - x_min * scale
+    offset_y = (canvas_height - person_height * scale) / 2 - y_min * scale
+    
+    # 转换关键点坐标到画布坐标
+    def transform_point(x, y):
+        new_x = int(x * scale + offset_x)
+        new_y = int(y * scale + offset_y)
+        return (new_x, new_y)
+    
+    # 定义身体各部分的线条粗细和颜色
+    body_color = (50, 50, 50)  # 深灰色
+    joint_color = (100, 150, 255)  # 浅蓝色关节
+    head_color = (255, 200, 150)  # 肤色头部
+    
+    # 1. 首先计算头部位置和大小
+    head_center = None
+    head_radius = 20  # 默认头部半径
+    neck_bottom = None  # 脖子底部位置（肩膀中点）
+    
+    # 计算肩膀位置
+    if keypoints[5][2] > 0.2 and keypoints[6][2] > 0.2:
+        shoulder_dist = np.sqrt((keypoints[5][0] - keypoints[6][0])**2 + 
+                               (keypoints[5][1] - keypoints[6][1])**2)
+        head_radius = int(shoulder_dist * scale * 0.4)  # 头部大小
+        
+        left_shoulder = transform_point(keypoints[5][0], keypoints[5][1])
+        right_shoulder = transform_point(keypoints[6][0], keypoints[6][1])
+        neck_bottom = ((left_shoulder[0] + right_shoulder[0]) // 2,
+                       (left_shoulder[1] + right_shoulder[1]) // 2)
+        
+        # 如果有鼻子关键点，直接使用它作为头部中心
+        if keypoints[0][2] > 0.1:
+            head_center = transform_point(keypoints[0][0], keypoints[0][1])
+        else:
+            # 否则从肩膀中点向上推算：脖子长度约为肩宽的0.4倍，头部半径再向上
+            neck_length = int(shoulder_dist * scale * 0.4)
+            head_center = (neck_bottom[0], neck_bottom[1] - neck_length - head_radius)
+    
+    # 2. 绘制脖子（从肩膀中点到头部底部）
+    if head_center is not None and neck_bottom is not None:
+        neck_top = (head_center[0], head_center[1] + head_radius)
+        cv2.line(canvas, neck_bottom, neck_top, body_color, 5)
+    
+    # 3. 绘制头部（简单的圆球，在脖子上方）
+    if head_center is not None:
+        # 绘制头部轮廓 - 只是一个简单的圆球
+        cv2.circle(canvas, head_center, head_radius, head_color, -1)
+        cv2.circle(canvas, head_center, head_radius, body_color, 2)
+    
+    # 3. 绘制躯干和四肢骨架（粗线条）
+    thickness_map = {
+        'torso': 8,      # 躯干
+        'arm_upper': 6,   # 大臂
+        'arm_lower': 5,   # 小臂
+        'leg_upper': 7,   # 大腿
+        'leg_lower': 6    # 小腿
+    }
+    
+    # 定义不同部位的连接和粗细
+    body_parts = [
+        # 躯干
+        ([5, 6], thickness_map['torso']),           # 肩膀
+        ([5, 11], thickness_map['torso']),          # 左侧躯干
+        ([6, 12], thickness_map['torso']),          # 右侧躯干
+        ([11, 12], thickness_map['torso']),         # 髋部
+        
+        # 左臂
+        ([5, 7], thickness_map['arm_upper']),       # 左大臂
+        ([7, 9], thickness_map['arm_lower']),       # 左小臂
+        
+        # 右臂
+        ([6, 8], thickness_map['arm_upper']),       # 右大臂
+        ([8, 10], thickness_map['arm_lower']),      # 右小臂
+        
+        # 左腿
+        ([11, 13], thickness_map['leg_upper']),     # 左大腿
+        ([13, 15], thickness_map['leg_lower']),     # 左小腿
+        
+        # 右腿
+        ([12, 14], thickness_map['leg_upper']),     # 右大腿
+        ([14, 16], thickness_map['leg_lower']),     # 右小腿
+    ]
+    
+    # 绘制身体各部分
+    for connection, thickness in body_parts:
+        pt1_idx, pt2_idx = connection
+        if (pt1_idx < len(keypoints) and pt2_idx < len(keypoints) and
+            keypoints[pt1_idx][2] > 0.3 and keypoints[pt2_idx][2] > 0.3):
+            pt1 = transform_point(keypoints[pt1_idx][0], keypoints[pt1_idx][1])
+            pt2 = transform_point(keypoints[pt2_idx][0], keypoints[pt2_idx][1])
+            cv2.line(canvas, pt1, pt2, body_color, thickness)
+    
+    # 4. 绘制关节点（较大的圆圈）
+    important_joints = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    for i in important_joints:
+        if i < len(keypoints) and keypoints[i][2] > 0.3:
+            pt = transform_point(keypoints[i][0], keypoints[i][1])
+            cv2.circle(canvas, pt, 8, joint_color, -1)
+            cv2.circle(canvas, pt, 8, body_color, 2)
+    
+    return canvas
+
+def show_photo_and_stickman(frame, person_bbox, current_keypoints):
+    """显示拍照的照片和火柴人形象"""
     if person_bbox is None:
         print("无法获取人的检测框")
         return
     
     x_min, y_min, x_max, y_max = person_bbox
     
-    # 裁剪人的区域（裁切目标框）
+    # 裁剪人的区域
     cropped_person = frame[y_min:y_max, x_min:x_max]
     
     if cropped_person.size == 0:
         print("检测框区域无效")
         return
     
-    # 生成时间戳用于文件名
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # 转换为base64（不保存原始照片以保护隐私）
-    person_image_base64 = encode_image_to_base64(cropped_person)
-    
-    # 调用AI生成动漫风格图片
-    print("正在生成动漫风格图片...")
-    anime_image_url = generate_anime_style_image(person_image_base64)
-    
-    if anime_image_url:
-        print(f"动漫风格图片URL: {anime_image_url}")
+    # 直接使用当前检测到的关键点（更准确）
+    print("正在生成火柴人...")
+    if current_keypoints is not None and len(current_keypoints) > 0:
+        # 检测手部关键点
+        print("正在检测手部...")
+        hands_data = detect_hands(frame)
         
-        # 下载并保存生成的动漫风格图片
-        try:
-            response = requests.get(anime_image_url)
-            response.raise_for_status()
-            
-            anime_filename = f"punch_{timestamp}.jpg"
-            anime_filepath = os.path.join(photos_dir, anime_filename)
-            
-            with open(anime_filepath, 'wb') as f:
-                f.write(response.content)
-            
-            print(f"动漫风格图片已保存: {anime_filepath}")
-            
-            # 读取并显示生成的图片
-            anime_image = cv2.imread(anime_filepath)
-            if anime_image is not None:
-                cv2.namedWindow("Anime Style - Punch Image", cv2.WINDOW_NORMAL)
-                cv2.resizeWindow("Anime Style - Punch Image", 800, 1000)
-                cv2.imshow("Anime Style - Punch Image", anime_image)
-            
-        except requests.exceptions.RequestException as e:
-            print(f"下载动漫风格图片失败: {e}")
-        except Exception as e:
-            print(f"保存动漫风格图片时出错: {e}")
+        if hands_data:
+            print(f"检测到 {len(hands_data)} 只手")
+            for hand in hands_data:
+                print(f"  - {hand['label']} 手")
+        else:
+            print("未检测到手部，将绘制基础火柴人")
+        
+        # 绘制带手部的完整火柴人
+        stickman_canvas = draw_stickman_with_hands(current_keypoints, hands_data)
+        
+        # 显示火柴人窗口
+        cv2.namedWindow("Stickman - Punch Pose", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Stickman - Punch Pose", 500, 700)
+        cv2.imshow("Stickman - Punch Pose", stickman_canvas)
+        
+        print("打卡成功！")
+        
+        # 打印关键点信息用于调试
+        print(f"关键点数量: {len(current_keypoints)}")
+        for i, (x, y, conf) in enumerate(current_keypoints):
+            if i < 5:  # 只打印前5个（头部相关）
+                print(f"关键点{i}: 置信度={conf:.2f}")
+    else:
+        print("无法获取关键点数据")
     
-    # 7. 计算并打印总耗时
-    end_time = time.time()
-    total_time = end_time - start_time
-    print(f"✓ 打卡完成！总耗时: {total_time:.2f}秒（从拍照到生成最终风格图片）")
+    # 也显示原始照片
+    cv2.namedWindow("Punch Photo", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Punch Photo", 600, 800)
+    cv2.imshow("Punch Photo", cropped_person)
 
 print("姿态打卡系统初始化...")
 print("请进入检测区域并保持pose 3秒进行打卡")
@@ -418,7 +629,7 @@ while True:
                             # 时间到，拍照
                             punch_state = "capturing"
                             person_bbox = get_person_bounding_box_from_detection(results)
-                            show_photo_and_anime_image(frame, person_bbox, person_keypoints)  # 显示原始照片和生成动漫风格图片
+                            show_photo_and_stickman(frame, person_bbox, person_keypoints)  # 显示原始照片和火柴人
                             punch_state = "success"
                             print("打卡完成！")
                         else:
