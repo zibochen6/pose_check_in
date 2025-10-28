@@ -89,6 +89,112 @@ result_queue = Queue(maxsize=1)
 last_results = None
 results_lock = threading.Lock()
 
+# UI显示相关的全局变量
+display_state = "camera"  # "camera" 或 "result"
+generated_image = None  # 生成的动漫图片
+is_generating = False  # 是否正在生成
+generation_angle = 0  # 旋转角度
+generation_lock = threading.Lock()
+
+def create_blur_with_spinner(frame, angle, text="Generating your avatar, please wait..."):
+    """创建模糊背景+旋转加载动画"""
+    # 高斯模糊
+    blurred = cv2.GaussianBlur(frame, (51, 51), 0)
+    
+    # 添加半透明遮罩
+    overlay = blurred.copy()
+    cv2.rectangle(overlay, (0, 0), (frame.shape[1], frame.shape[0]), (0, 0, 0), -1)
+    blurred = cv2.addWeighted(blurred, 0.7, overlay, 0.3, 0)
+    
+    # 绘制旋转圆圈
+    center_x, center_y = frame.shape[1] // 2, frame.shape[0] // 2
+    radius = 60
+    thickness = 8
+    
+    # 绘制圆环
+    cv2.circle(blurred, (center_x, center_y), radius, (100, 100, 100), thickness)
+    
+    # 绘制旋转的弧
+    arc_length = 90  # 弧长（度）
+    start_angle = int(angle) % 360
+    cv2.ellipse(blurred, (center_x, center_y), (radius, radius), 
+                0, start_angle, start_angle + arc_length, (0, 255, 255), thickness)
+    
+    # 添加文字提示
+    lines = text.split('\n')
+    y_offset = center_y + radius + 60
+    for line in lines:
+        text_size = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        text_x = center_x - text_size[0] // 2
+        cv2.putText(blurred, line, (text_x, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        y_offset += 40
+    
+    return blurred
+
+def create_side_by_side_view(left_img, right_img, gap=40):
+    """创建左右拼接视图（美化版）"""
+    # 调整右图大小以匹配左图高度
+    h1, w1 = left_img.shape[:2]
+    h2, w2 = right_img.shape[:2]
+    
+    # 调整右图高度
+    scale = h1 / h2
+    new_w2 = int(w2 * scale)
+    right_resized = cv2.resize(right_img, (new_w2, h1))
+    
+    # 创建拼接画布（深色背景）
+    total_width = w1 + gap + new_w2
+    canvas = np.zeros((h1, total_width, 3), dtype=np.uint8)
+    canvas[:] = (40, 40, 40)  # 深灰色背景
+    
+    # 添加边框和阴影效果到左图
+    border = 5
+    shadow_offset = 8
+    # 阴影
+    cv2.rectangle(canvas, (shadow_offset, shadow_offset), 
+                 (w1 + shadow_offset, h1 + shadow_offset), (0, 0, 0), -1)
+    # 白色边框
+    cv2.rectangle(canvas, (0, 0), (w1, h1), (255, 255, 255), border)
+    # 放置左图
+    canvas[border:h1-border, border:w1-border] = left_img[border:h1-border, border:w1-border]
+    
+    # 绘制渐变分隔线
+    sep_x = w1 + gap // 2
+    for i in range(h1):
+        alpha = i / h1  # 渐变效果
+        color = (int(50 + 100 * alpha), int(50 + 100 * alpha), int(50 + 100 * alpha))
+        cv2.line(canvas, (sep_x, i), (sep_x, i), color, 3)
+    
+    # 添加边框和阴影到右图
+    right_x = w1 + gap
+    # 阴影
+    cv2.rectangle(canvas, (right_x + shadow_offset, shadow_offset), 
+                 (right_x + new_w2 + shadow_offset, h1 + shadow_offset), (0, 0, 0), -1)
+    # 白色边框
+    cv2.rectangle(canvas, (right_x, 0), (right_x + new_w2, h1), (255, 255, 255), border)
+    # 放置右图
+    canvas[border:h1-border, right_x+border:right_x+new_w2-border] = right_resized[border:h1-border, border:new_w2-border]
+    
+    # 添加标题栏（带渐变背景）
+    header_h = 60
+    header = np.zeros((header_h, total_width, 3), dtype=np.uint8)
+    for i in range(header_h):
+        alpha = 1 - (i / header_h)
+        color = int(80 * alpha)
+        header[i, :] = (color, color, color)
+    
+    # 合并标题栏
+    result = np.vstack([header, canvas])
+    
+    # 添加标题文字
+    cv2.putText(result, "Original (No Background)", (20, 40), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(result, "AI Generated Anime Style", (right_x + 20, 40), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 100, 255), 2, cv2.LINE_AA)
+    
+    return result
+
 def inference_worker():
     """后台推理线程"""
     global last_results
@@ -257,7 +363,7 @@ def generate_anime_style_image(person_image_base64):
             size="2K",
             response_format="url",
             extra_body={
-                "image": f"data:image/jpeg;base64,{person_image_base64}",
+                "image": f"data:image/png;base64,{person_image_base64}",  # 使用PNG格式
                 "watermark": False  # 去除水印
             }
         )
@@ -266,8 +372,10 @@ def generate_anime_style_image(person_image_base64):
         print(f"生成动漫风格图片失败: {e}")
         return None
 
-def show_photo_and_anime_image(frame, person_bbox, current_keypoints):
-    """显示拍照的照片并生成动漫风格图片"""
+def generate_anime_image_async(frame, person_bbox):
+    """后台线程生成动漫风格图片"""
+    global generated_image, bg_removed_image, is_generating, display_state
+    
     # 记录开始时间
     start_time = time.time()
     
@@ -289,10 +397,26 @@ def show_photo_and_anime_image(frame, person_bbox, current_keypoints):
     
     # Step 1: 背景去除
     print("正在去除背景...")
-    bg_removed = remove(cropped_person)
+    # 移除背景，rembg返回PIL Image (RGBA格式，背景已透明)
+    bg_removed_pil = remove(cropped_person)
     
-    # Step 2: 转换为base64（使用去背景的图片）
-    person_image_base64 = encode_image_to_base64(bg_removed)
+    # 转换为numpy数组 (RGBA格式)
+    bg_removed = np.array(bg_removed_pil)
+    
+    # rembg返回的是RGBA格式（背景已经透明），需要转换为BGRA（OpenCV格式）
+    if len(bg_removed.shape) == 3 and bg_removed.shape[2] == 4:
+        # RGBA -> BGRA
+        bg_removed = cv2.cvtColor(bg_removed, cv2.COLOR_RGBA2BGRA)
+    
+    # Step 2: 保存去背景的原始图片（带透明度）
+    bg_removed_filename = f"punch_{timestamp}_bg_removed.png"
+    bg_removed_filepath = os.path.join(photos_dir, bg_removed_filename)
+    cv2.imwrite(bg_removed_filepath, bg_removed)
+    print(f"去背景图片已保存: {bg_removed_filepath}")
+    
+    # Step 3: 转换为base64（使用去背景的图片，保存为PNG以保持透明度）
+    _, buffer = cv2.imencode('.png', bg_removed)
+    person_image_base64 = base64.b64encode(buffer).decode('utf-8')
     
     # 调用AI生成动漫风格图片
     print("正在生成动漫风格图片...")
@@ -314,12 +438,14 @@ def show_photo_and_anime_image(frame, person_bbox, current_keypoints):
             
             print(f"动漫风格图片已保存: {anime_filepath}")
             
-            # 读取并显示生成的图片
+            # 读取生成的图片并更新全局变量
             anime_image = cv2.imread(anime_filepath)
             if anime_image is not None:
-                cv2.namedWindow("Anime Style - Punch Image", cv2.WINDOW_NORMAL)
-                cv2.resizeWindow("Anime Style - Punch Image", 800, 1000)
-                cv2.imshow("Anime Style - Punch Image", anime_image)
+                with generation_lock:
+                    generated_image = anime_image.copy()
+                    is_generating = False
+                    display_state = "result"
+                print(f"✓ 图片生成完成！")
             
         except requests.exceptions.RequestException as e:
             print(f"下载动漫风格图片失败: {e}")
@@ -433,12 +559,24 @@ while True:
                         remaining_time = pose_duration - elapsed_time
                         
                         if remaining_time <= 0:
-                            # 时间到，拍照
-                            punch_state = "capturing"
+                            # 时间到，拍照并启动后台生成
+                            punch_state = "generating"
                             person_bbox = get_person_bounding_box_from_detection(results)
-                            show_photo_and_anime_image(frame, person_bbox, person_keypoints)  # 显示原始照片和生成动漫风格图片
-                            punch_state = "success"
-                            print("打卡完成！")
+                            
+                            # 标记开始生成
+                            with generation_lock:
+                                is_generating = True
+                                display_state = "camera"
+                                generated_image = None
+                            
+                            # 在后台线程生成图片
+                            generation_thread = threading.Thread(
+                                target=generate_anime_image_async, 
+                                args=(frame.copy(), person_bbox),
+                                daemon=True
+                            )
+                            generation_thread.start()
+                            print("开始生成动漫风格图片...")
                         else:
                             # 显示倒计时
                             cv2.putText(display_frame, f"Hold pose: {remaining_time:.1f}s", 
@@ -451,33 +589,39 @@ while True:
                         pose_start_time = None
                         print(f"姿态不稳定，距离: {pose_distance:.1f}，阈值: {pose_stable_threshold}")
                 
+                elif punch_state == "generating":
+                    # 正在生成，保持状态直到生成完成
+                    with generation_lock:
+                        if display_state == "result":
+                            # 生成完成，切换到success状态
+                            punch_state = "success"
+                
                 elif punch_state == "success":
-                    # 成功状态，等待重置
-                    cv2.putText(display_frame, "Punch Success!", (10, 100), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    cv2.putText(display_frame, "Move away to reset", (10, 140), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                    # 成功状态，等待人离开重置
+                    pass  # 显示由display_state控制
             else:
                 # 人不在ROI内，重置状态
-                if punch_state != "waiting":
+                if punch_state == "success" or punch_state == "generating":
+                    # 从成功状态重置
                     punch_state = "waiting"
                     pose_start_time = None
-                    print("请进入检测区域")
+                    with generation_lock:
+                        display_state = "camera"
+                        generated_image = None
+                        is_generating = False
+                    print("System reset, ready for next punch-in")
+                elif punch_state != "waiting":
+                    punch_state = "waiting"
+                    pose_start_time = None
+                    print("Please enter detection area")
         
         elif num_people > 1:
             # 多个人的情况
-            if punch_state == "success":
-                # 打卡成功后，允许多人存在，不重置
-                cv2.putText(display_frame, "Punch Success!", (10, 100), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(display_frame, "Move away to reset", (10, 140), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-            else:
+            if punch_state not in ["success", "generating"]:
                 # 其他状态下多个人，重置状态
                 punch_state = "waiting"
                 pose_start_time = None
-                cv2.putText(display_frame, "Too many people! Only one person allowed", 
-                          (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                print("Too many people detected! Please ensure only one person in the area.")
         
         else:
             # 没有人，重置状态
@@ -486,71 +630,141 @@ while True:
                 pose_start_time = None
                 print("区域内无人，系统已重置")
     
-    # 显示状态信息
-    status_text = {
-        "waiting": "Waiting for person...",
-        "detecting": "Person detected, preparing...",
-        "posing": "Hold your pose!",
-        "capturing": "Capturing...",
-        "success": "Success!"
-    }
-    # 显示FPS（左上角）
-    # cv2.putText(display_frame, f"FPS: {fps:.1f}", 
-    #           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    # 根据状态决定显示什么
+    with generation_lock:
+        current_display_state = display_state
+        current_is_generating = is_generating
+        current_generated = generated_image
     
-    # 显示状态（FPS下方）
-    cv2.putText(display_frame, f"Status: {status_text.get(punch_state, 'Unknown')}", 
-              (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    # 最终显示的画面
+    final_display = None
     
-    # 显示检测到的人数
-    # num_people = len(keypoints) if results[0].keypoints is not None else 0
-    # cv2.putText(display_frame, f"People: {num_people}", (10, 60), 
-    #           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    if punch_state == "generating" and current_is_generating:
+        # 生成中：显示模糊+旋转动画
+        generation_angle = (generation_angle + 10) % 360  # 旋转角度
+        final_display = create_blur_with_spinner(
+            display_frame, 
+            generation_angle,
+            "Generating your avatar\nPlease wait..."
+        )
+    elif current_display_state == "result" and current_generated is not None:
+        # 显示结果：只显示生成的动漫图片（单窗口）
+        # 使用与摄像头相同的窗口大小
+        target_width = 640
+        target_height = 480
+        
+        # 标题和底部的高度
+        header_h = 60
+        footer_h = 80
+        
+        # 可用于显示图片的高度
+        image_height = target_height - header_h - footer_h
+        
+        # 调整生成图片的大小以适应窗口
+        img = current_generated.copy()
+        h, w = img.shape[:2]
+        
+        # 按比例缩放，使高度刚好fit
+        scale_h = image_height / h
+        scale_w = target_width / w
+        scale = min(scale_h, scale_w)  # 使用较小的比例，确保不超出
+        
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        img_resized = cv2.resize(img, (new_w, new_h))
+        
+        # 创建居中的图片区域（黑色背景）
+        img_canvas = np.zeros((image_height, target_width, 3), dtype=np.uint8)
+        # 居中放置图片
+        x_offset = (target_width - new_w) // 2
+        y_offset = (image_height - new_h) // 2
+        img_canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = img_resized
+        
+        # 添加标题栏
+        header = np.zeros((header_h, target_width, 3), dtype=np.uint8)
+        # 渐变背景
+        for i in range(header_h):
+            alpha = 1 - (i / header_h)
+            color = int(80 * alpha)
+            header[i, :] = (color, color + 40, color + 60)
+        
+        # 添加标题文字（缩小字体以适应窗口）
+        title = "AI Anime Style - Success!"
+        text_size = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        text_x = (target_width - text_size[0]) // 2
+        cv2.putText(header, title, (text_x, 38), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+        
+        # 添加底部提示框
+        footer = np.zeros((footer_h, target_width, 3), dtype=np.uint8)
+        # 渐变背景
+        for i in range(footer_h):
+            alpha = i / footer_h
+            color = int(50 * alpha)
+            footer[i, :] = (color, color, color)
+        
+        # 添加提示文字（缩小字体）
+        text1 = "Complete! Leave area to reset"
+        
+        text_size1 = cv2.getTextSize(text1, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+        text_x1 = (target_width - text_size1[0]) // 2
+        cv2.putText(footer, text1, (text_x1, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        
+        # 合并标题、图片和底部提示 (确保总大小为640x480)
+        final_display = np.vstack([header, img_canvas, footer])
+    else:
+        # 正常状态：显示摄像头画面
+        final_display = display_frame.copy()
+        
+        # 显示状态信息
+        status_text = {
+            "waiting": "Waiting for person...",
+            "detecting": "Person detected, get ready!",
+            "posing": "Hold your pose!",
+            "capturing": "Capturing...",
+            "generating": "Generating...",
+            "success": "Success!"
+        }
+        
+        # 显示状态
+        cv2.putText(final_display, f"Status: {status_text.get(punch_state, 'Unknown')}", 
+                  (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     
-    # 显示检测到的手数
-    # num_hands = len(hands_data) if hands_data else 0
-    # cv2.putText(display_frame, f"Hands: {num_hands}", (10, 90), 
-    #           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-    
-    # 在右上角显示状态图标
-    icon_size = 80  # 图标大小
-    icon_x = display_frame.shape[1] - icon_size - 10  # 右上角，距离边缘10像素
-    icon_y = 10
-    
-    # 根据状态计算进度和显示图标
-    if punch_state == "waiting":
-        # 等待状态：显示红色图标
-        current_icon = red_icon
-        progress = 0.0
-    elif punch_state == "detecting":
-        # 检测到人：红色开始淡化
-        current_icon = blend_icons(red_icon, green_icon, 0.2)
-        progress = 0.2
-    elif punch_state == "posing":
-        # 正在打卡：根据倒计时显示进度
-        if pose_start_time is not None:
-            elapsed = time.time() - pose_start_time
-            progress = min(elapsed / pose_duration, 1.0)  # 0.0 -> 1.0
-            current_icon = blend_icons(red_icon, green_icon, progress)
+        # 在摄像头画面上显示状态图标
+        icon_size = 80
+        icon_x = final_display.shape[1] - icon_size - 10
+        icon_y = 10
+        
+        # 根据状态计算进度和显示图标
+        if punch_state == "waiting":
+            current_icon = red_icon
+            progress = 0.0
+        elif punch_state == "detecting":
+            current_icon = blend_icons(red_icon, green_icon, 0.2)
+            progress = 0.2
+        elif punch_state == "posing":
+            if pose_start_time is not None:
+                elapsed = time.time() - pose_start_time
+                progress = min(elapsed / pose_duration, 1.0)
+                current_icon = blend_icons(red_icon, green_icon, progress)
+            else:
+                current_icon = red_icon
+                progress = 0.0
+        elif punch_state in ["generating", "success"]:
+            current_icon = green_icon
+            progress = 1.0
         else:
             current_icon = red_icon
             progress = 0.0
-    elif punch_state == "success":
-        # 成功：显示绿色图标
-        current_icon = green_icon
-        progress = 1.0
-    else:
-        current_icon = red_icon
-        progress = 0.0
+        
+        # 缩放并叠加图标
+        resized_icon = cv2.resize(current_icon, (icon_size, icon_size))
+        final_display = overlay_icon_with_alpha(final_display, resized_icon, icon_x, icon_y, alpha=0.9)
     
-    # 缩放图标到指定大小
-    resized_icon = cv2.resize(current_icon, (icon_size, icon_size))
-    
-    # 叠加图标到画面
-    display_frame = overlay_icon_with_alpha(display_frame, resized_icon, icon_x, icon_y, alpha=0.9)
-    
-    # 显示画面
-    cv2.imshow("Punch Clock System", display_frame)
+    # 显示最终画面
+    if final_display is not None:
+        cv2.imshow("AI Punch Clock System", final_display)
     
     # 按'q'键退出
     key = cv2.waitKey(1) & 0xFF
