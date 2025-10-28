@@ -5,22 +5,38 @@ from ultralytics import YOLO
 import os
 from datetime import datetime
 from config import *
-import mediapipe as mp
 import requests
 import base64
 from openai import OpenAI
+import threading
+from queue import Queue
+from rembg import remove
+
+# 检测是否支持GUI显示，但如果DISPLAY未设置则先设置它
+HAVE_GUI = True
+DISPLAY_ENV = os.environ.get('DISPLAY', ':0')
+if not DISPLAY_ENV or DISPLAY_ENV.startswith(':'):
+    os.environ['DISPLAY'] = ':0'
+    print(f"设置 DISPLAY={os.environ['DISPLAY']}")
+
+# 尝试测试GUI支持
+try:
+    test_img = np.zeros((1, 1, 3), dtype=np.uint8)
+    # 不显示，只创建窗口
+    cv2.namedWindow("_test_window", cv2.WINDOW_NORMAL)
+    cv2.waitKey(1)
+    cv2.destroyWindow("_test_window")
+    print("OpenCV GUI 支持已确认")
+except Exception as e:
+    print(f"警告: OpenCV GUI测试失败: {e}")
+    print("将尝试继续使用GUI功能...")
+    # 但仍然允许GUI尝试，不设为False
+    HAVE_GUI = True
 
 # 加载YOLO姿态估计模型
 model = YOLO(MODEL_PATH,task="pose")  # 使用TensorRT引擎文件
 
-# 初始化MediaPipe手部检测
-mp_hands = mp.solutions.hands
-hands_detector = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=2,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+# MediaPipe手部检测已移除，仅使用姿态识别以提高系统流畅性
 
 # 初始化OpenAI客户端（用于图片风格化）
 openai_client = OpenAI(
@@ -46,6 +62,13 @@ if red_icon is None or green_icon is None:
 # 初始化摄像头
 cap = cv2.VideoCapture(camera_index)
 
+# 设置MJPG格式（Motion-JPEG, compressed）
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+
+# 可选分辨率：
+# 1920x1080 (推荐，高分辨率)
+# 1280x960
+# 1280x720
 # 设置摄像头分辨率
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -57,6 +80,36 @@ if not os.path.exists(photos_dir):
 
 # FPS计算变量
 p_time = time.time()
+
+# 异步推理队列
+inference_queue = Queue(maxsize=1)
+result_queue = Queue(maxsize=1)
+
+# 最后推理结果
+last_results = None
+results_lock = threading.Lock()
+
+def inference_worker():
+    """后台推理线程"""
+    global last_results
+    while True:
+        frame = inference_queue.get()
+        if frame is None:  # 停止信号
+            break
+        
+        try:
+            # 进行姿态估计推理（降低推理分辨率以提高速度）
+            results = model(frame, verbose=False, imgsz=640)
+            
+            # 更新结果（线程安全）
+            with results_lock:
+                last_results = results
+        except Exception as e:
+            print(f"推理错误: {e}")
+
+# 启动推理线程
+inference_thread = threading.Thread(target=inference_worker, daemon=True)
+inference_thread.start()
 
 
 def overlay_icon_with_alpha(background, icon, x, y, alpha=1.0):
@@ -129,15 +182,15 @@ def is_person_in_roi(keypoints, roi_x, roi_y, roi_width, roi_height):
     # 如果超过一半的关键点在ROI内，认为人在区域内
     return valid_keypoints > len([k for k in keypoints if k[2] > 0.5]) * 0.5
 
-def calculate_pose_distance(keypoints1, keypoints2, hands_data1=None, hands_data2=None):
-    """计算两个姿态之间的距离（包括身体和手部）"""
+def calculate_pose_distance(keypoints1, keypoints2):
+    """计算两个姿态之间的距离（仅使用身体关键点，提高检测流畅性）"""
     if keypoints1 is None or keypoints2 is None:
         return float('inf')
     
     total_distance = 0
     valid_points = 0
     
-    # 1. 身体关键点距离计算
+    # 身体关键点距离计算
     important_keypoints = [0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]  # 鼻子、左肩、右肩、左肘、右肘、左腕、右腕、左髋、右髋、左膝、右膝、左踝、右踝
     
     for i in important_keypoints:
@@ -147,28 +200,6 @@ def calculate_pose_distance(keypoints1, keypoints2, hands_data1=None, hands_data
                              (keypoints1[i][1] - keypoints2[i][1])**2)
             total_distance += distance
             valid_points += 1
-    
-    # 2. 手部关键点距离计算
-    if hands_data1 and hands_data2 and len(hands_data1) > 0 and len(hands_data2) > 0:
-        # 尝试匹配相同的手（左手对左手，右手对右手）
-        for hand1 in hands_data1:
-            for hand2 in hands_data2:
-                if hand1['label'] == hand2['label']:  # 相同的手
-                    landmarks1 = hand1['landmarks']
-                    landmarks2 = hand2['landmarks']
-                    
-                    # 只计算关键手部点（手腕、指尖、掌心关键点）
-                    key_hand_points = [0, 4, 8, 12, 16, 20]  # 手腕和5个指尖
-                    
-                    for idx in key_hand_points:
-                        if idx < len(landmarks1) and idx < len(landmarks2):
-                            # 手部坐标是归一化的，需要乘以画面尺寸
-                            dist = np.sqrt(
-                                ((landmarks1[idx][0] - landmarks2[idx][0]) * frame_width)**2 + 
-                                ((landmarks1[idx][1] - landmarks2[idx][1]) * frame_height)**2
-                            )
-                            total_distance += dist
-                            valid_points += 1
     
     return total_distance / valid_points if valid_points > 0 else float('inf')
 
@@ -214,32 +245,10 @@ def get_person_bounding_box_from_detection(results):
     
     return (x_min, y_min, x_max, y_max)
 
-def detect_hands(image):
-    """使用MediaPipe检测手部关键点"""
-    # 转换为RGB（MediaPipe需要RGB格式）
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = hands_detector.process(image_rgb)
-    
-    hands_data = []
-    if results.multi_hand_landmarks and results.multi_handedness:
-        for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-            # 获取手部类型（左手或右手）
-            hand_label = handedness.classification[0].label  # "Left" or "Right"
-            
-            # 提取21个手部关键点
-            landmarks = []
-            for landmark in hand_landmarks.landmark:
-                landmarks.append([landmark.x, landmark.y, landmark.z])
-            
-            hands_data.append({
-                'label': hand_label,
-                'landmarks': np.array(landmarks)
-            })
-    
-    return hands_data
+# detect_hands 函数已移除，不再使用手部检测以提高系统流畅性
 
 def generate_anime_style_image(person_image_base64):
-    """调用AI生成动漫风格图片"""
+    """调用AI生成动漫风格图片（无水印）"""
     try:
         # 生成图片
         images_response = openai_client.images.generate(
@@ -249,7 +258,7 @@ def generate_anime_style_image(person_image_base64):
             response_format="url",
             extra_body={
                 "image": f"data:image/jpeg;base64,{person_image_base64}",
-                "watermark": True
+                "watermark": False  # 去除水印
             }
         )
         return images_response.data[0].url
@@ -278,8 +287,12 @@ def show_photo_and_anime_image(frame, person_bbox, current_keypoints):
     # 生成时间戳用于文件名
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # 转换为base64（不保存原始照片以保护隐私）
-    person_image_base64 = encode_image_to_base64(cropped_person)
+    # Step 1: 背景去除
+    print("正在去除背景...")
+    bg_removed = remove(cropped_person)
+    
+    # Step 2: 转换为base64（使用去背景的图片）
+    person_image_base64 = encode_image_to_base64(bg_removed)
     
     # 调用AI生成动漫风格图片
     print("正在生成动漫风格图片...")
@@ -330,15 +343,25 @@ while True:
         break
     
     # 计算FPS
+    c_time = time.time()
+    fps = 1 / (c_time - p_time) if (c_time - p_time) > 0 else 0
+    p_time = c_time
     
-
     # 优化暗光环境下的画面质量
     enhanced_frame = enhance_frame_for_dark_lighting(frame)
     
-    # 进行姿态估计推理（使用增强后的画面）
-    results = model(enhanced_frame, verbose=False)
+    # 异步推理（非阻塞）
+    if not inference_queue.full():
+        try:
+            inference_queue.put_nowait(enhanced_frame)
+        except:
+            pass
     
-    # 创建显示帧（带可视化）
+    # 获取最新的推理结果（线程安全）
+    with results_lock:
+        results = last_results
+    
+    # 创建显示帧（带可视化）- 确保每帧都显示流畅的画面
     display_frame = frame.copy()
     
     # 绘制ROI区域
@@ -348,7 +371,7 @@ while True:
     #             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     
     # 绘制YOLO姿态检测结果（根据配置决定是否显示）
-    if show_detection_results and results[0].keypoints is not None:
+    if results is not None and show_detection_results and results[0].keypoints is not None:
         pose_keypoints = results[0].keypoints.data.cpu().numpy()
         
         for person_kp in pose_keypoints:
@@ -371,7 +394,7 @@ while True:
     
     # 获取关键点数据
     current_keypoints = None
-    if results[0].keypoints is not None:
+    if results is not None and results[0].keypoints is not None:
         keypoints = results[0].keypoints.data.cpu().numpy()
         num_people = len(keypoints)
         
@@ -392,17 +415,12 @@ while True:
                     punch_state = "posing"
                     pose_start_time = time.time()
                     last_pose_keypoints = person_keypoints.copy()
-                    # 保存当前手部数据
-                    last_hands_data = detect_hands(frame)
                     # print("开始检测pose，请保持姿态3秒...")
 
                 #已经摆pose了，开始检测pose是否稳定
                 elif punch_state == "posing":
-                    # 获取当前手部数据
-                    current_hands = detect_hands(frame)
-                    
-                    # 检查姿态是否稳定（包括身体和手部）
-                    pose_distance = calculate_pose_distance(person_keypoints, last_pose_keypoints, current_hands, last_hands_data)
+                    # 检查姿态是否稳定（仅使用身体关键点）
+                    pose_distance = calculate_pose_distance(person_keypoints, last_pose_keypoints)
                     current_time = time.time()
                     elapsed_time = current_time - pose_start_time
                     
@@ -427,7 +445,6 @@ while True:
                                       (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                             # 更新参考姿态（允许轻微移动）
                             last_pose_keypoints = person_keypoints.copy()
-                            last_hands_data = current_hands
                     else:
                         # 姿态不稳定，重新开始
                         punch_state = "detecting"
@@ -469,58 +486,6 @@ while True:
                 pose_start_time = None
                 print("区域内无人，系统已重置")
     
-    # 实时检测手部并在主窗口显示（根据配置决定是否显示）
-    hands_data = detect_hands(frame)
-    if show_detection_results and hands_data:
-        # 绘制手部检测结果
-        for hand in hands_data:
-            landmarks = hand['landmarks']
-            hand_label = hand['label']
-            
-            # 将归一化坐标转换为像素坐标
-            h, w = frame.shape[:2]
-            
-            # 定义手部连接关系
-            hand_connections = [
-                # 拇指
-                [0, 1], [1, 2], [2, 3], [3, 4],
-                # 食指
-                [0, 5], [5, 6], [6, 7], [7, 8],
-                # 中指
-                [0, 9], [9, 10], [10, 11], [11, 12],
-                # 无名指
-                [0, 13], [13, 14], [14, 15], [15, 16],
-                # 小指
-                [0, 17], [17, 18], [18, 19], [19, 20],
-                # 手掌
-                [5, 9], [9, 13], [13, 17]
-            ]
-            
-            # 绘制手部骨架连接线
-            for connection in hand_connections:
-                pt1_idx, pt2_idx = connection
-                if pt1_idx < len(landmarks) and pt2_idx < len(landmarks):
-                    pt1 = (int(landmarks[pt1_idx][0] * w), int(landmarks[pt1_idx][1] * h))
-                    pt2 = (int(landmarks[pt2_idx][0] * w), int(landmarks[pt2_idx][1] * h))
-                    cv2.line(display_frame, pt1, pt2, (0, 255, 0), 2)
-            
-            # 绘制手部关键点
-            for i, landmark in enumerate(landmarks):
-                x = int(landmark[0] * w)
-                y = int(landmark[1] * h)
-                # 手腕和指尖用不同颜色和大小
-                if i in [0, 4, 8, 12, 16, 20]:  # 手腕和指尖
-                    cv2.circle(display_frame, (x, y), 6, (255, 0, 0), -1)
-                else:
-                    cv2.circle(display_frame, (x, y), 4, (0, 255, 255), -1)
-            
-            # 在手腕位置显示手的标签
-            if len(landmarks) > 0:
-                wrist_x = int(landmarks[0][0] * w)
-                wrist_y = int(landmarks[0][1] * h)
-                cv2.putText(display_frame, f"{hand_label} Hand", (wrist_x - 30, wrist_y - 20), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-    
     # 显示状态信息
     status_text = {
         "waiting": "Waiting for person...",
@@ -529,9 +494,6 @@ while True:
         "capturing": "Capturing...",
         "success": "Success!"
     }
-    c_time = time.time()
-    fps = 1 / (c_time - p_time)
-    p_time = c_time
     # 显示FPS（左上角）
     # cv2.putText(display_frame, f"FPS: {fps:.1f}", 
     #           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -591,10 +553,16 @@ while True:
     cv2.imshow("Punch Clock System", display_frame)
     
     # 按'q'键退出
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
         break
+    
+    # 确保适当的帧率
+    time.sleep(0.033)  # 约30 FPS
 
 # 释放资源
+# 通知推理线程停止
+inference_queue.put(None)
 cap.release()
 cv2.destroyAllWindows()
 print("程序结束")
