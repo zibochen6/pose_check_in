@@ -1,8 +1,40 @@
+import os
+# OpenCV 使用 Qt5 后端（构建时只支持 Qt，不支持 GTK）
+# 需要正确配置 Qt 插件路径，确保 Qt 能找到 xcb 插件
+# 必须在导入 cv2 之前设置环境变量
+
+# 恢复 Qt 插件目录（如果之前被禁用了）
+qt_plugin_path = os.path.expanduser('~/.local/lib/python3.10/site-packages/cv2/qt/plugins')
+qt_plugin_backup = qt_plugin_path + '.disabled'
+if os.path.exists(qt_plugin_backup) and not os.path.exists(qt_plugin_path):
+    try:
+        os.rename(qt_plugin_backup, qt_plugin_path)
+        print(f"已恢复 Qt 插件目录")
+    except Exception as e:
+        print(f"警告：无法恢复 Qt 插件目录: {e}")
+
+# 设置 Qt 插件路径，确保能找到 xcb 插件
+# OpenCV 的 Qt 插件目录
+if os.path.exists(qt_plugin_path):
+    # 设置 QT_PLUGIN_PATH 包含 OpenCV 的插件目录和系统 Qt 插件目录
+    system_qt_plugins = '/usr/lib/aarch64-linux-gnu/qt5/plugins'
+    qt_plugin_paths = [qt_plugin_path, system_qt_plugins]
+    os.environ['QT_PLUGIN_PATH'] = ':'.join(qt_plugin_paths)
+    print(f"已设置 Qt 插件路径: {os.environ['QT_PLUGIN_PATH']}")
+
+# 设置优先使用 V4L2（Linux 摄像头后端）
+os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
+os.environ['OPENCV_VIDEOIO_PRIORITY_DSHOW'] = '0'
+os.environ['OPENCV_VIDEOIO_PRIORITY_V4L2'] = '1'
+
+# 确保 DISPLAY 环境变量正确设置
+if 'DISPLAY' not in os.environ or not os.environ.get('DISPLAY'):
+    os.environ['DISPLAY'] = ':0'
+
 import cv2
 import time
 import numpy as np
 from ultralytics import YOLO
-import os
 from datetime import datetime
 from config import *
 import requests
@@ -12,26 +44,11 @@ import threading
 from queue import Queue
 from rembg import remove
 
-# 检测是否支持GUI显示，但如果DISPLAY未设置则先设置它
+# GUI 支持
 HAVE_GUI = True
-DISPLAY_ENV = os.environ.get('DISPLAY', ':0')
-if not DISPLAY_ENV or DISPLAY_ENV.startswith(':'):
-    os.environ['DISPLAY'] = ':0'
-    print(f"设置 DISPLAY={os.environ['DISPLAY']}")
 
-# 尝试测试GUI支持
-try:
-    test_img = np.zeros((1, 1, 3), dtype=np.uint8)
-    # 不显示，只创建窗口
-    cv2.namedWindow("_test_window", cv2.WINDOW_NORMAL)
-    cv2.waitKey(1)
-    cv2.destroyWindow("_test_window")
-    print("OpenCV GUI 支持已确认")
-except Exception as e:
-    print(f"警告: OpenCV GUI测试失败: {e}")
-    print("将尝试继续使用GUI功能...")
-    # 但仍然允许GUI尝试，不设为False
-    HAVE_GUI = True
+# OpenCV 使用 Qt5 后端（已正确配置 Qt 插件路径）
+print("OpenCV 使用 Qt5 后端运行")
 
 # 加载YOLO姿态估计模型
 model = YOLO(MODEL_PATH,task="pose")  # 使用TensorRT引擎文件
@@ -73,10 +90,40 @@ cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+# 获取实际摄像头分辨率
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+print(f"摄像头分辨率: {frame_width}x{frame_height}")
+
 # 创建照片保存目录
 photos_dir = "punch_photos"
 if not os.path.exists(photos_dir):
     os.makedirs(photos_dir)
+
+# 创建全屏窗口
+window_name = "AI Punch Clock System"
+cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+# 获取屏幕分辨率（通过创建一个临时全屏窗口来获取）
+screen_width = 1920  # 默认值
+screen_height = 1080  # 默认值
+try:
+    # 尝试获取实际屏幕分辨率
+    import subprocess
+    result = subprocess.run(['xrandr'], capture_output=True, text=True)
+    for line in result.stdout.split('\n'):
+        if '*' in line:  # 当前使用的分辨率会有*标记
+            parts = line.split()
+            for part in parts:
+                if 'x' in part and part[0].isdigit():
+                    screen_width, screen_height = map(int, part.split('x'))
+                    break
+            break
+except:
+    print("无法自动获取屏幕分辨率，使用默认值1920x1080")
+
+print(f"屏幕分辨率: {screen_width}x{screen_height}")
 
 # FPS计算变量
 p_time = time.time()
@@ -190,10 +237,27 @@ def create_side_by_side_view(left_img, right_img, gap=40):
     # 添加标题文字
     cv2.putText(result, "Original (No Background)", (20, 40), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(result, "AI Generated Anime Style", (right_x + 20, 40), 
+    cv2.putText(result, "AI Generated Style", (right_x + 20, 40), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 100, 255), 2, cv2.LINE_AA)
     
     return result
+
+def scale_to_fullscreen(image, target_width, target_height):
+    """将图像缩放以填充整个屏幕，不留黑边
+    
+    方案：直接将图像拉伸到目标尺寸，显示完整画面，无裁剪
+    
+    Args:
+        image: 输入图像
+        target_width: 目标宽度（屏幕宽度）
+        target_height: 目标高度（屏幕高度）
+    
+    Returns:
+        缩放后的图像
+    """
+    # 直接将图像拉伸到目标尺寸，不裁剪任何内容
+    resized = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+    return resized
 
 def inference_worker():
     """后台推理线程"""
@@ -309,24 +373,6 @@ def calculate_pose_distance(keypoints1, keypoints2):
     
     return total_distance / valid_points if valid_points > 0 else float('inf')
 
-def enhance_frame_for_dark_lighting(frame):
-    """优化暗光环境下的画面质量"""
-    # 使用CLAHE (Contrast Limited Adaptive Histogram Equalization) 增强对比度
-    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    
-    # 对L通道应用CLAHE
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-    l = clahe.apply(l)
-    
-    # 合并通道并转换回BGR
-    enhanced_lab = cv2.merge([l, a, b])
-    enhanced_frame = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
-    
-    # 轻微降噪
-    enhanced_frame = cv2.bilateralFilter(enhanced_frame, 9, 75, 75)
-    
-    return enhanced_frame
 
 def get_person_bounding_box_from_detection(results):
     """从YOLO检测结果中直接获取人的边界框"""
@@ -356,20 +402,21 @@ def get_person_bounding_box_from_detection(results):
 def generate_anime_style_image(person_image_base64):
     """调用AI生成动漫风格图片（无水印）"""
     try:
-        # 生成图片
+        # 生成图片doubao-seedream-4-0-250828
         images_response = openai_client.images.generate(
             model="doubao-seedream-4-0-250828",
-            prompt="保留画面主体的姿态，将图片风格转化为动漫风格，但不要改变人物的五官神态，要能在动漫风格的图片看的出来主角真人的特点和神态！",
-            size="2K",
+            prompt="Keep the exact same pose and body position as the original image. Only change the art style to Disney animation style. Do NOT change: body pose, hand positions, head angle, facial expression, body proportions, or any body movements. Only change: colors, lighting, line art style, and visual effects. This is a pose preservation task, not a recreation task. The person must maintain exactly the same stance and positioning.",
+            size="1k",
             response_format="url",
             extra_body={
                 "image": f"data:image/png;base64,{person_image_base64}",  # 使用PNG格式
-                "watermark": False  # 去除水印
+                "watermark": False,  # 去除水印
+                "negative_prompt": "change pose, change body position, change hand position, change head angle, change facial expression, change body proportions, change body movements, change stance, change positioning, different pose, different body position, different hand position, different head angle, different facial expression, different body proportions, different body movements, different stance, different positioning, pose change, body position change, hand position change, head angle change, facial expression change, body proportion change, body movement change, stance change, positioning change"
             }
         )
         return images_response.data[0].url
     except Exception as e:
-        print(f"生成动漫风格图片失败: {e}")
+        print(f"生成风格图片失败: {e}")
         return None
 
 def generate_anime_image_async(frame, person_bbox):
@@ -388,6 +435,10 @@ def generate_anime_image_async(frame, person_bbox):
     # 裁剪人的区域（裁切目标框）
     cropped_person = frame[y_min:y_max, x_min:x_max]
     
+    # 调试：保存原始裁剪图像
+    # cv2.imwrite("./debug_cropped_original.png", cropped_person)
+    # print(f"原始裁剪图像已保存，形状: {cropped_person.shape}")
+    
     if cropped_person.size == 0:
         print("检测框区域无效")
         return
@@ -397,33 +448,77 @@ def generate_anime_image_async(frame, person_bbox):
     
     # Step 1: 背景去除
     print("正在去除背景...")
-    # 移除背景，rembg返回PIL Image (RGBA格式，背景已透明)
+    
+    # 移除背景，rembg返回PIL Image
     bg_removed_pil = remove(cropped_person)
     
-    # 转换为numpy数组 (RGBA格式)
+    # 转换为numpy数组
     bg_removed = np.array(bg_removed_pil)
     
-    # rembg返回的是RGBA格式（背景已经透明），需要转换为BGRA（OpenCV格式）
+    # 修复rembg颜色问题：使用原始图像的颜色信息
     if len(bg_removed.shape) == 3 and bg_removed.shape[2] == 4:
-        # RGBA -> BGRA
-        bg_removed = cv2.cvtColor(bg_removed, cv2.COLOR_RGBA2BGRA)
+        # RGBA格式 - 只保留alpha通道，用原始图像替换颜色
+        alpha = bg_removed[:, :, 3]
+        
+        # 使用原始裁剪图像的颜色（BGR格式）
+        original_bgr = cropped_person.copy()
+        
+        # 确保尺寸匹配
+        # print(f"原始图像尺寸: {original_bgr.shape[:2]}, Alpha通道尺寸: {alpha.shape}")
+        if original_bgr.shape[:2] != alpha.shape:
+            # print("尺寸不匹配，正在调整原始图像尺寸...")
+            original_bgr = cv2.resize(original_bgr, (alpha.shape[1], alpha.shape[0]))
+            # print(f"调整后尺寸: {original_bgr.shape[:2]}")
+        
+        # 将BGR转换为RGB
+        original_rgb = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2RGB)
+        
+        # 重新组合：原始RGB + rembg的alpha通道
+        bg_removed = np.dstack([original_rgb, alpha])
+        print("已修复rembg颜色问题：使用原始图像颜色 + rembg透明度")
+        
+        # 调试：保存修复后的图像（完整RGBA）
+        # rgb_only = bg_removed[:, :, :3]
+        # cv2.imwrite("./debug_fixed_color.png", cv2.cvtColor(rgb_only, cv2.COLOR_RGB2BGR))
+        
+        # 保存完整的RGBA图像用于调试
+        # bgr_only = cv2.cvtColor(rgb_only, cv2.COLOR_RGB2BGR)
+        # bgra = np.dstack([bgr_only, alpha])
+        # cv2.imwrite("./debug_fixed_rgba.png", bgra)
+        
+    elif len(bg_removed.shape) == 3 and bg_removed.shape[2] == 3:
+        # RGB格式，直接使用原始图像
+        bg_removed = cropped_person.copy()
+        print("已修复rembg颜色问题：直接使用原始图像")
     
-    # Step 2: 保存去背景的原始图片（带透明度）
-    bg_removed_filename = f"punch_{timestamp}_bg_removed.png"
-    bg_removed_filepath = os.path.join(photos_dir, bg_removed_filename)
-    cv2.imwrite(bg_removed_filepath, bg_removed)
-    print(f"去背景图片已保存: {bg_removed_filepath}")
+    # 转换为OpenCV格式（BGR + Alpha）
+    if len(bg_removed.shape) == 3:
+        if bg_removed.shape[2] == 4:  # RGBA格式
+            # 已经是修复后的RGBA格式，只需要转换为BGRA
+            alpha = bg_removed[:, :, 3]
+            rgb = bg_removed[:, :, :3]
+            # RGB -> BGR
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            # 重新组合BGR + Alpha
+            bg_removed = np.dstack([bgr, alpha])
+            # print(f"最终BGRA图像形状: {bg_removed.shape}")
+        elif bg_removed.shape[2] == 3:  # RGB格式
+            # 已经是BGR格式，无需转换
+            pass
     
-    # Step 3: 转换为base64（使用去背景的图片，保存为PNG以保持透明度）
+    # cv2.imwrite("./bg_removed.png", bg_removed)
+    # Step 2: 转换为base64（使用去背景的图片，保存为PNG以保持透明度）
+    # 注意：为了用户隐私，不保存去背景的图片到磁盘
     _, buffer = cv2.imencode('.png', bg_removed)
     person_image_base64 = base64.b64encode(buffer).decode('utf-8')
+    # print("背景去除完成（图片仅用于AI生成，未保存到磁盘）")
     
     # 调用AI生成动漫风格图片
-    print("正在生成动漫风格图片...")
+    print("正在生成风格图片...")
     anime_image_url = generate_anime_style_image(person_image_base64)
     
     if anime_image_url:
-        print(f"动漫风格图片URL: {anime_image_url}")
+        print(f"风格图片URL: {anime_image_url}")
         
         # 下载并保存生成的动漫风格图片
         try:
@@ -436,7 +531,7 @@ def generate_anime_image_async(frame, person_bbox):
             with open(anime_filepath, 'wb') as f:
                 f.write(response.content)
             
-            print(f"动漫风格图片已保存: {anime_filepath}")
+            print(f"风格图片已保存: {anime_filepath}")
             
             # 读取生成的图片并更新全局变量
             anime_image = cv2.imread(anime_filepath)
@@ -448,9 +543,9 @@ def generate_anime_image_async(frame, person_bbox):
                 print(f"✓ 图片生成完成！")
             
         except requests.exceptions.RequestException as e:
-            print(f"下载动漫风格图片失败: {e}")
+            print(f"下载风格图片失败: {e}")
         except Exception as e:
-            print(f"保存动漫风格图片时出错: {e}")
+            print(f"保存风格图片时出错: {e}")
     
     # 7. 计算并打印总耗时
     end_time = time.time()
@@ -473,13 +568,12 @@ while True:
     fps = 1 / (c_time - p_time) if (c_time - p_time) > 0 else 0
     p_time = c_time
     
-    # 优化暗光环境下的画面质量
-    enhanced_frame = enhance_frame_for_dark_lighting(frame)
     
-    # 异步推理（非阻塞）
+    
+    # 异步推理（非阻塞）- 直接使用原始帧
     if not inference_queue.full():
         try:
-            inference_queue.put_nowait(enhanced_frame)
+            inference_queue.put_nowait(frame)
         except:
             pass
     
@@ -492,9 +586,7 @@ while True:
     
     # 绘制ROI区域
     cv2.rectangle(display_frame, (roi_x, roi_y), 
-                  (roi_x + roi_width, roi_y + roi_height), (0, 255, 255), 2)
-    # cv2.putText(display_frame, "Detection Area", (roi_x, roi_y - 10), 
-    #             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                  (roi_x + roi_width, roi_y + roi_height), (0, 255, 0), 1)
     
     # 绘制YOLO姿态检测结果（根据配置决定是否显示）
     if results is not None and show_detection_results and results[0].keypoints is not None:
@@ -514,9 +606,6 @@ while True:
             for i, (x, y, conf) in enumerate(person_kp):
                 if conf > 0.5:
                     cv2.circle(display_frame, (int(x), int(y)), 5, (0, 0, 255), -1)  # 红色关键点
-                    # 可选：显示关键点编号
-                    # cv2.putText(display_frame, f"{i}", (int(x), int(y-10)), 
-                    #           cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
     
     # 获取关键点数据
     current_keypoints = None
@@ -550,10 +639,6 @@ while True:
                     current_time = time.time()
                     elapsed_time = current_time - pose_start_time
                     
-                    # 显示当前姿态距离用于调试
-                    # cv2.putText(display_frame, f"Pose Distance: {pose_distance:.1f}", 
-                    #           (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    
                     if pose_distance < pose_stable_threshold:
                         # 姿态稳定，更新计时
                         remaining_time = pose_duration - elapsed_time
@@ -576,11 +661,11 @@ while True:
                                 daemon=True
                             )
                             generation_thread.start()
-                            print("开始生成动漫风格图片...")
+                            print("开始生成风格图片...")
                         else:
                             # 显示倒计时
                             cv2.putText(display_frame, f"Hold pose: {remaining_time:.1f}s", 
-                                      (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                                      (200, 430), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                             # 更新参考姿态（允许轻微移动）
                             last_pose_keypoints = person_keypoints.copy()
                     else:
@@ -610,9 +695,15 @@ while True:
                         generated_image = None
                         is_generating = False
                     print("System reset, ready for next punch-in")
+                    print(f"Debug: punch_state={punch_state}, display_state={display_state}, generated_image={'None' if generated_image is None else 'Exists'}")
                 elif punch_state != "waiting":
                     punch_state = "waiting"
                     pose_start_time = None
+                    # 确保也重置显示状态
+                    with generation_lock:
+                        display_state = "camera"
+                        generated_image = None
+                        is_generating = False
                     print("Please enter detection area")
         
         elif num_people > 1:
@@ -621,6 +712,11 @@ while True:
                 # 其他状态下多个人，重置状态
                 punch_state = "waiting"
                 pose_start_time = None
+                # 确保也重置显示状态
+                with generation_lock:
+                    display_state = "camera"
+                    generated_image = None
+                    is_generating = False
                 print("Too many people detected! Please ensure only one person in the area.")
         
         else:
@@ -628,7 +724,13 @@ while True:
             if punch_state != "waiting":
                 punch_state = "waiting"
                 pose_start_time = None
+                # 确保也重置显示状态
+                with generation_lock:
+                    display_state = "camera"
+                    generated_image = None
+                    is_generating = False
                 print("区域内无人，系统已重置")
+                print(f"Debug: punch_state={punch_state}, display_state={display_state}, generated_image={'None' if generated_image is None else 'Exists'}")
     
     # 根据状态决定显示什么
     with generation_lock:
@@ -647,11 +749,11 @@ while True:
             generation_angle,
             "Generating your avatar\nPlease wait..."
         )
-    elif current_display_state == "result" and current_generated is not None:
+    elif current_display_state == "result" and current_generated is not None and punch_state == "success":
         # 显示结果：只显示生成的动漫图片（单窗口）
-        # 使用与摄像头相同的窗口大小
-        target_width = 640
-        target_height = 480
+        # 使用屏幕分辨率
+        target_width = screen_width
+        target_height = screen_height
         
         # 标题和底部的高度
         header_h = 60
@@ -689,7 +791,7 @@ while True:
             header[i, :] = (color, color + 40, color + 60)
         
         # 添加标题文字（缩小字体以适应窗口）
-        title = "AI Anime Style - Success!"
+        title = "Success!"
         text_size = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
         text_x = (target_width - text_size[0]) // 2
         cv2.putText(header, title, (text_x, 38), 
@@ -729,7 +831,11 @@ while True:
         
         # 显示状态
         cv2.putText(final_display, f"Status: {status_text.get(punch_state, 'Unknown')}", 
-                  (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                  (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+        
+        # # 显示FPS（左上角，在状态信息下方）
+        # cv2.putText(final_display, f"FPS: {fps:.1f}", 
+        #           (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     
         # 在摄像头画面上显示状态图标
         icon_size = 80
@@ -762,9 +868,11 @@ while True:
         resized_icon = cv2.resize(current_icon, (icon_size, icon_size))
         final_display = overlay_icon_with_alpha(final_display, resized_icon, icon_x, icon_y, alpha=0.9)
     
-    # 显示最终画面
+    # 显示最终画面（缩放到全屏）
     if final_display is not None:
-        cv2.imshow("AI Punch Clock System", final_display)
+        # 将画面缩放并裁剪以填充整个屏幕
+        fullscreen_display = scale_to_fullscreen(final_display, screen_width, screen_height)
+        cv2.imshow(window_name, fullscreen_display)
     
     # 按'q'键退出
     key = cv2.waitKey(1) & 0xFF
@@ -779,4 +887,7 @@ while True:
 inference_queue.put(None)
 cap.release()
 cv2.destroyAllWindows()
+
+# Qt 插件目录已正确配置，无需恢复
+
 print("程序结束")
