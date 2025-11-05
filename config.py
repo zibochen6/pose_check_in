@@ -6,6 +6,19 @@ camera_index = 0
 # 显示选项
 show_detection_results = False  # True: 显示姿态检测结果, False: 不显示检测结果
 
+# ===== 性能优化配置 =====
+# 背景去除: 使用 MediaPipe Selfie Segmentation（实时高效，60+ FPS）
+SEGMENTATION_THRESHOLD = 0.7  # 抠图阈值 0.0-1.0，越高背景去除越彻底。推荐: 0.5(保留更多)/0.7(平衡)/0.9(彻底)
+
+# PNG压缩参数
+PNG_COMPRESSION_LEVEL = 1  # PNG压缩级别 0-9，越小越快但文件越大。推荐: 1-3
+
+# AI生图优化参数
+AI_IMAGE_SIZE = "1k"  # 可选: "512"(最快), "1k"(推荐), "2k"(高质量但慢)
+
+# 调试选项
+SAVE_DEBUG_IMAGES = False  # True: 保存去背景图片用于调试, False: 不保存（隐私保护）
+
 # 打卡系统状态变量
 punch_state = "waiting"  # waiting, detecting, posing, capturing, success
 pose_start_time = None

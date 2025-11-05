@@ -20,7 +20,7 @@ if os.path.exists(qt_plugin_path):
     system_qt_plugins = '/usr/lib/aarch64-linux-gnu/qt5/plugins'
     qt_plugin_paths = [qt_plugin_path, system_qt_plugins]
     os.environ['QT_PLUGIN_PATH'] = ':'.join(qt_plugin_paths)
-    print(f"已设置 Qt 插件路径: {os.environ['QT_PLUGIN_PATH']}")
+    # print(f"已设置 Qt 插件路径: {os.environ['QT_PLUGIN_PATH']}")
 
 # 设置优先使用 V4L2（Linux 摄像头后端）
 os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
@@ -42,7 +42,7 @@ import base64
 from openai import OpenAI
 import threading
 from queue import Queue
-from rembg import remove
+import mediapipe as mp
 
 # GUI 支持
 HAVE_GUI = True
@@ -53,7 +53,17 @@ print("OpenCV 使用 Qt5 后端运行")
 # 加载YOLO姿态估计模型
 model = YOLO(MODEL_PATH,task="pose")  # 使用TensorRT引擎文件
 
-# MediaPipe手部检测已移除，仅使用姿态识别以提高系统流畅性
+# 初始化 MediaPipe Selfie Segmentation（实时背景去除）
+print(f"\n{'='*50}")
+print(f"正在加载背景去除模型: MediaPipe Selfie Segmentation...")
+model_load_start = time.time()
+mp_selfie_segmentation = mp.solutions.selfie_segmentation
+# model_selection: 0=general (快速), 1=landscape (精确但稍慢)
+segmentation_model = mp_selfie_segmentation.SelfieSegmentation(model_selection=0)
+model_load_time = time.time() - model_load_start
+print(f"✓ 背景去除模型加载完成，耗时: {model_load_time:.2f}秒")
+print(f"✓ 模型类型: MediaPipe (实时优化)")
+print(f"{'='*50}\n")
 
 # 初始化OpenAI客户端（用于图片风格化）
 openai_client = OpenAI(
@@ -402,16 +412,16 @@ def get_person_bounding_box_from_detection(results):
 def generate_anime_style_image(person_image_base64):
     """调用AI生成动漫风格图片（无水印）"""
     try:
-        # 生成图片doubao-seedream-4-0-250828
+        # 优化5: 简化prompt以加快API响应速度
         images_response = openai_client.images.generate(
             model="doubao-seedream-4-0-250828",
-            prompt="Keep the exact same pose and body position as the original image. Only change the art style to Disney animation style. Do NOT change: body pose, hand positions, head angle, facial expression, body proportions, or any body movements. Only change: colors, lighting, line art style, and visual effects. This is a pose preservation task, not a recreation task. The person must maintain exactly the same stance and positioning.",
-            size="1k",
+            prompt="Transform to Disney animation style. Preserve exact pose, body position, and proportions. Only change art style, colors, and lighting.",
+            size=AI_IMAGE_SIZE,  # 使用配置文件中的设置
             response_format="url",
             extra_body={
-                "image": f"data:image/png;base64,{person_image_base64}",  # 使用PNG格式
-                "watermark": False,  # 去除水印
-                "negative_prompt": "change pose, change body position, change hand position, change head angle, change facial expression, change body proportions, change body movements, change stance, change positioning, different pose, different body position, different hand position, different head angle, different facial expression, different body proportions, different body movements, different stance, different positioning, pose change, body position change, hand position change, head angle change, facial expression change, body proportion change, body movement change, stance change, positioning change"
+                "image": f"data:image/png;base64,{person_image_base64}",
+                "watermark": False,
+                "negative_prompt": "different pose, changed body position, altered proportions"
             }
         )
         return images_response.data[0].url
@@ -426,6 +436,10 @@ def generate_anime_image_async(frame, person_bbox):
     # 记录开始时间
     start_time = time.time()
     
+    # 初始化性能监控变量
+    bg_removal_time = 0
+    api_time = 0
+    
     if person_bbox is None:
         print("无法获取人的检测框")
         return
@@ -435,10 +449,6 @@ def generate_anime_image_async(frame, person_bbox):
     # 裁剪人的区域（裁切目标框）
     cropped_person = frame[y_min:y_max, x_min:x_max]
     
-    # 调试：保存原始裁剪图像
-    # cv2.imwrite("./debug_cropped_original.png", cropped_person)
-    # print(f"原始裁剪图像已保存，形状: {cropped_person.shape}")
-    
     if cropped_person.size == 0:
         print("检测框区域无效")
         return
@@ -446,76 +456,71 @@ def generate_anime_image_async(frame, person_bbox):
     # 生成时间戳用于文件名
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Step 1: 背景去除
-    print("正在去除背景...")
+    # Step 1: MediaPipe 背景去除（实时高效）
+    print("\n" + "="*50)
+    print(f"📸 背景去除开始 (模型: MediaPipe Selfie Segmentation)")
+    bg_removal_start = time.time()
     
-    # 移除背景，rembg返回PIL Image
-    bg_removed_pil = remove(cropped_person)
+    # MediaPipe 处理
+    h_orig, w_orig = cropped_person.shape[:2]
+    print(f"  ├─ 图像尺寸: {w_orig}x{h_orig}")
     
-    # 转换为numpy数组
-    bg_removed = np.array(bg_removed_pil)
+    # 转换为 RGB (MediaPipe 需要 RGB)
+    print(f"  ├─ 正在抠图...")
+    segmentation_start = time.time()
+    rgb_frame = cv2.cvtColor(cropped_person, cv2.COLOR_BGR2RGB)
     
-    # 修复rembg颜色问题：使用原始图像的颜色信息
-    if len(bg_removed.shape) == 3 and bg_removed.shape[2] == 4:
-        # RGBA格式 - 只保留alpha通道，用原始图像替换颜色
-        alpha = bg_removed[:, :, 3]
-        
-        # 使用原始裁剪图像的颜色（BGR格式）
-        original_bgr = cropped_person.copy()
-        
-        # 确保尺寸匹配
-        # print(f"原始图像尺寸: {original_bgr.shape[:2]}, Alpha通道尺寸: {alpha.shape}")
-        if original_bgr.shape[:2] != alpha.shape:
-            # print("尺寸不匹配，正在调整原始图像尺寸...")
-            original_bgr = cv2.resize(original_bgr, (alpha.shape[1], alpha.shape[0]))
-            # print(f"调整后尺寸: {original_bgr.shape[:2]}")
-        
-        # 将BGR转换为RGB
-        original_rgb = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2RGB)
-        
-        # 重新组合：原始RGB + rembg的alpha通道
-        bg_removed = np.dstack([original_rgb, alpha])
-        print("已修复rembg颜色问题：使用原始图像颜色 + rembg透明度")
-        
-        # 调试：保存修复后的图像（完整RGBA）
-        # rgb_only = bg_removed[:, :, :3]
-        # cv2.imwrite("./debug_fixed_color.png", cv2.cvtColor(rgb_only, cv2.COLOR_RGB2BGR))
-        
-        # 保存完整的RGBA图像用于调试
-        # bgr_only = cv2.cvtColor(rgb_only, cv2.COLOR_RGB2BGR)
-        # bgra = np.dstack([bgr_only, alpha])
-        # cv2.imwrite("./debug_fixed_rgba.png", bgra)
-        
-    elif len(bg_removed.shape) == 3 and bg_removed.shape[2] == 3:
-        # RGB格式，直接使用原始图像
-        bg_removed = cropped_person.copy()
-        print("已修复rembg颜色问题：直接使用原始图像")
+    # 执行分割
+    results = segmentation_model.process(rgb_frame)
+    mask = results.segmentation_mask
     
-    # 转换为OpenCV格式（BGR + Alpha）
-    if len(bg_removed.shape) == 3:
-        if bg_removed.shape[2] == 4:  # RGBA格式
-            # 已经是修复后的RGBA格式，只需要转换为BGRA
-            alpha = bg_removed[:, :, 3]
-            rgb = bg_removed[:, :, :3]
-            # RGB -> BGR
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            # 重新组合BGR + Alpha
-            bg_removed = np.dstack([bgr, alpha])
-            # print(f"最终BGRA图像形状: {bg_removed.shape}")
-        elif bg_removed.shape[2] == 3:  # RGB格式
-            # 已经是BGR格式，无需转换
-            pass
+    segmentation_time = time.time() - segmentation_start
+    print(f"  ├─ 抠图完成: {segmentation_time:.2f}秒")
     
-    # cv2.imwrite("./bg_removed.png", bg_removed)
-    # Step 2: 转换为base64（使用去背景的图片，保存为PNG以保持透明度）
-    # 注意：为了用户隐私，不保存去背景的图片到磁盘
-    _, buffer = cv2.imencode('.png', bg_removed)
+    # 创建 BGRA 图像（原始颜色 + 透明通道）
+    # 提高阈值以获得更彻底的背景去除
+    # mask 是 0.0-1.0 的浮点数，使用阈值处理
+    threshold = SEGMENTATION_THRESHOLD  # 使用配置文件中的阈值
+    mask_threshold = (mask > threshold).astype(np.uint8) * 255
+    
+    # 可选：应用形态学操作以平滑边缘
+    kernel = np.ones((3, 3), np.uint8)
+    mask_threshold = cv2.morphologyEx(mask_threshold, cv2.MORPH_CLOSE, kernel)
+    mask_threshold = cv2.morphologyEx(mask_threshold, cv2.MORPH_OPEN, kernel)
+    
+    # 创建 BGRA 图像
+    bg_removed = cv2.cvtColor(cropped_person, cv2.COLOR_BGR2BGRA)
+    bg_removed[:, :, 3] = mask_threshold  # 设置 alpha 通道
+    
+    bg_removal_time = time.time() - bg_removal_start
+    print(f"  └─ 背景去除总耗时: {bg_removal_time:.2f}秒")
+    print("="*50)
+    
+    # 统计透明度
+    non_zero = np.count_nonzero(mask_threshold < 255)
+    total = mask_threshold.size
+    transparent_percent = (non_zero / total) * 100
+    print(f"  ├─ 背景透明度: {transparent_percent:.1f}% 像素已透明化")
+    print(f"  ├─ 抠图阈值: {threshold} (越高背景去除越彻底)")
+    
+    # 保存调试图片（如果启用）
+    if SAVE_DEBUG_IMAGES:
+        debug_path = os.path.join(photos_dir, f"debug_nobg_{timestamp}.png")
+        cv2.imwrite(debug_path, bg_removed)
+        print(f"  ├─ 调试图片已保存: {debug_path}")
+    
+    # PNG 编码
+    encode_param = [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION_LEVEL]
+    _, buffer = cv2.imencode('.png', bg_removed, encode_param)
     person_image_base64 = base64.b64encode(buffer).decode('utf-8')
-    # print("背景去除完成（图片仅用于AI生成，未保存到磁盘）")
+    print(f"  └─ 图像编码完成，大小: {len(person_image_base64)/1024:.1f}KB")
     
     # 调用AI生成动漫风格图片
     print("正在生成风格图片...")
+    api_start = time.time()
     anime_image_url = generate_anime_style_image(person_image_base64)
+    api_time = time.time() - api_start
+    print(f"API调用耗时: {api_time:.2f}秒")
     
     if anime_image_url:
         print(f"风格图片URL: {anime_image_url}")
@@ -547,10 +552,18 @@ def generate_anime_image_async(frame, person_bbox):
         except Exception as e:
             print(f"保存风格图片时出错: {e}")
     
-    # 7. 计算并打印总耗时
+    # 计算并打印总耗时
     end_time = time.time()
     total_time = end_time - start_time
-    print(f"✓ 打卡完成！总耗时: {total_time:.2f}秒（从拍照到生成最终风格图片）")
+    
+    # 性能汇总
+    print("\n" + "="*50)
+    print("📊 性能汇总:")
+    print(f"  ├─ 背景去除: {bg_removal_time:.2f}秒")
+    print(f"  ├─ API调用:  {api_time:.2f}秒")
+    print(f"  └─ 总耗时:   {total_time:.2f}秒")
+    print("="*50)
+    print(f"✓ 打卡完成！\n")
 
 print("姿态打卡系统初始化...")
 print("请进入检测区域并保持pose 3秒进行打卡")
@@ -805,13 +818,16 @@ while True:
             color = int(50 * alpha)
             footer[i, :] = (color, color, color)
         
-        # 添加提示文字（缩小字体）
+        # 添加提示文字（放大并居中）
         text1 = "Complete! Leave area to reset"
         
-        text_size1 = cv2.getTextSize(text1, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-        text_x1 = (target_width - text_size1[0]) // 2
-        cv2.putText(footer, text1, (text_x1, 50), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        font_scale = 1.2  # 放大字体
+        thickness = 3     # 加粗
+        text_size1 = cv2.getTextSize(text1, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
+        text_x1 = (target_width - text_size1[0]) // 2  # 居中
+        text_y1 = footer_h // 2 + text_size1[1] // 2   # 垂直居中
+        cv2.putText(footer, text1, (text_x1, text_y1), 
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
         
         # 合并标题、图片和底部提示 (确保总大小为640x480)
         final_display = np.vstack([header, img_canvas, footer])
@@ -838,35 +854,23 @@ while True:
         #           (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     
         # 在摄像头画面上显示状态图标
+        # 只在 posing 状态（用户保持姿势）时显示，避免其他状态的干扰
         icon_size = 80
-        icon_x = final_display.shape[1] - icon_size - 10
-        icon_y = 10
         
-        # 根据状态计算进度和显示图标
-        if punch_state == "waiting":
-            current_icon = red_icon
-            progress = 0.0
-        elif punch_state == "detecting":
-            current_icon = blend_icons(red_icon, green_icon, 0.2)
-            progress = 0.2
-        elif punch_state == "posing":
-            if pose_start_time is not None:
-                elapsed = time.time() - pose_start_time
-                progress = min(elapsed / pose_duration, 1.0)
-                current_icon = blend_icons(red_icon, green_icon, progress)
-            else:
-                current_icon = red_icon
-                progress = 0.0
-        elif punch_state in ["generating", "success"]:
-            current_icon = green_icon
-            progress = 1.0
-        else:
-            current_icon = red_icon
-            progress = 0.0
-        
-        # 缩放并叠加图标
-        resized_icon = cv2.resize(current_icon, (icon_size, icon_size))
-        final_display = overlay_icon_with_alpha(final_display, resized_icon, icon_x, icon_y, alpha=0.9)
+        # 仅在 posing 状态且有倒计时时显示图标
+        if punch_state == "posing" and pose_start_time is not None:
+            # 图标显示在屏幕中央，"Hold pose"文字上方
+            icon_x = (final_display.shape[1] - icon_size) // 2  # 水平居中
+            icon_y = 320  # "Hold pose"文字在430，图标显示在上方
+            
+            # 计算进度和图标颜色（从红到绿的渐变）
+            elapsed = time.time() - pose_start_time
+            progress = min(elapsed / pose_duration, 1.0)
+            current_icon = blend_icons(red_icon, green_icon, progress)
+            
+            # 叠加图标
+            resized_icon = cv2.resize(current_icon, (icon_size, icon_size))
+            final_display = overlay_icon_with_alpha(final_display, resized_icon, icon_x, icon_y, alpha=0.9)
     
     # 显示最终画面（缩放到全屏）
     if final_display is not None:

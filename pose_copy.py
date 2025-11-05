@@ -90,10 +90,40 @@ cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+# 获取实际摄像头分辨率
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+print(f"摄像头分辨率: {frame_width}x{frame_height}")
+
 # 创建照片保存目录
 photos_dir = "punch_photos"
 if not os.path.exists(photos_dir):
     os.makedirs(photos_dir)
+
+# 创建全屏窗口
+window_name = "AI Punch Clock System"
+cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+# 获取屏幕分辨率（通过创建一个临时全屏窗口来获取）
+screen_width = 1920  # 默认值
+screen_height = 1080  # 默认值
+try:
+    # 尝试获取实际屏幕分辨率
+    import subprocess
+    result = subprocess.run(['xrandr'], capture_output=True, text=True)
+    for line in result.stdout.split('\n'):
+        if '*' in line:  # 当前使用的分辨率会有*标记
+            parts = line.split()
+            for part in parts:
+                if 'x' in part and part[0].isdigit():
+                    screen_width, screen_height = map(int, part.split('x'))
+                    break
+            break
+except:
+    print("无法自动获取屏幕分辨率，使用默认值1920x1080")
+
+print(f"屏幕分辨率: {screen_width}x{screen_height}")
 
 # FPS计算变量
 p_time = time.time()
@@ -211,6 +241,23 @@ def create_side_by_side_view(left_img, right_img, gap=40):
                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 100, 255), 2, cv2.LINE_AA)
     
     return result
+
+def scale_to_fullscreen(image, target_width, target_height):
+    """将图像缩放以填充整个屏幕，不留黑边
+    
+    方案：直接将图像拉伸到目标尺寸，显示完整画面，无裁剪
+    
+    Args:
+        image: 输入图像
+        target_width: 目标宽度（屏幕宽度）
+        target_height: 目标高度（屏幕高度）
+    
+    Returns:
+        缩放后的图像
+    """
+    # 直接将图像拉伸到目标尺寸，不裁剪任何内容
+    resized = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+    return resized
 
 def inference_worker():
     """后台推理线程"""
@@ -428,22 +475,12 @@ def generate_anime_image_async(frame, person_bbox):
         
         # 重新组合：原始RGB + rembg的alpha通道
         bg_removed = np.dstack([original_rgb, alpha])
-        print("已修复rembg颜色问题：使用原始图像颜色 + rembg透明度")
-        
-        # 调试：保存修复后的图像（完整RGBA）
-        # rgb_only = bg_removed[:, :, :3]
-        # cv2.imwrite("./debug_fixed_color.png", cv2.cvtColor(rgb_only, cv2.COLOR_RGB2BGR))
-        
-        # 保存完整的RGBA图像用于调试
-        # bgr_only = cv2.cvtColor(rgb_only, cv2.COLOR_RGB2BGR)
-        # bgra = np.dstack([bgr_only, alpha])
-        # cv2.imwrite("./debug_fixed_rgba.png", bgra)
+        # print("已修复rembg颜色问题：使用原始图像颜色 + rembg透明度")
         
     elif len(bg_removed.shape) == 3 and bg_removed.shape[2] == 3:
         # RGB格式，直接使用原始图像
         bg_removed = cropped_person.copy()
-        print("已修复rembg颜色问题：直接使用原始图像")
-    
+        # print("已修复rembg颜色问题：直接使用原始图像")
     # 转换为OpenCV格式（BGR + Alpha）
     if len(bg_removed.shape) == 3:
         if bg_removed.shape[2] == 4:  # RGBA格式
@@ -466,7 +503,6 @@ def generate_anime_image_async(frame, person_bbox):
     person_image_base64 = base64.b64encode(buffer).decode('utf-8')
     # print("背景去除完成（图片仅用于AI生成，未保存到磁盘）")
     
-    # 调用AI生成动漫风格图片
     print("正在生成风格图片...")
     anime_image_url = generate_anime_style_image(person_image_base64)
     
@@ -704,9 +740,9 @@ while True:
         )
     elif current_display_state == "result" and current_generated is not None and punch_state == "success":
         # 显示结果：只显示生成的动漫图片（单窗口）
-        # 使用与摄像头相同的窗口大小
-        target_width = 640
-        target_height = 480
+        # 使用屏幕分辨率
+        target_width = screen_width
+        target_height = screen_height
         
         # 标题和底部的高度
         header_h = 60
@@ -786,7 +822,7 @@ while True:
         cv2.putText(final_display, f"Status: {status_text.get(punch_state, 'Unknown')}", 
                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
         
-        # 显示FPS（左上角，在状态信息下方）
+        # # 显示FPS（左上角，在状态信息下方）
         # cv2.putText(final_display, f"FPS: {fps:.1f}", 
         #           (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     
@@ -821,9 +857,11 @@ while True:
         resized_icon = cv2.resize(current_icon, (icon_size, icon_size))
         final_display = overlay_icon_with_alpha(final_display, resized_icon, icon_x, icon_y, alpha=0.9)
     
-    # 显示最终画面
+    # 显示最终画面（缩放到全屏）
     if final_display is not None:
-        cv2.imshow("AI Punch Clock System", final_display)
+        # 将画面缩放并裁剪以填充整个屏幕
+        fullscreen_display = scale_to_fullscreen(final_display, screen_width, screen_height)
+        cv2.imshow(window_name, fullscreen_display)
     
     # 按'q'键退出
     key = cv2.waitKey(1) & 0xFF
