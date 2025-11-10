@@ -1,0 +1,75 @@
+背景:
+    现在实现打卡的程序已经差不多功能完整了，现在我需要完善整个打卡流程！
+
+打卡流程：
+1.用户使用他的nfc卡名片，在jetson上刷一下，jetson获取到：https://makerfaire-nfc.seeed.cn/api/v1/cards/{名片 UUID}
+
+现在有一个可用的测试链接：https://makerfaire-nfc.seeed.cn/api/v1/cards/5397d68f-6b54-4ec9-856f-560b07961fd9
+
+这个链接：
+链接可以读到用户的信息json文件如下：
+{
+    "code": 0,
+    "msg": "",
+    "data": {
+        "id": 1000,
+        "uuid": "5397d68f-6b54-4ec9-856f-560b07961fd9",
+        "creator_session_id": "cb2aa98e-96ba-4940-a44f-31f70f5aa94c",
+        "nick_name": "百度 小吴",
+        "logo_url": "https://sensecap-statics.seeed.cn/nfc-trace/makerfaire-2025-dev/logo_5397d68f-6b54-4ec9-856f-560b07961fd9_l4dito.jpg",
+        "avatar_url": "",
+        "location": "广东 深圳",
+        "official_name": "百度科技",
+        "email": "baidu@baidu.com",
+        "contact_way": [],
+        "is_external_link": false,
+        "forward_link": "",
+        "created_at": 1761985375,
+        "updated_at": 0,
+        "cleanup_time": 0
+    }
+}
+其中用户的头像是：`logo_url`: 用户上传的头像。需要将用户的uuid与其头像和最后打卡生成的火柴人形象绑定，
+以区分不同的用户！
+
+2.用户来到摄像头下面进行摆拍pose，固定姿态三秒后打卡完成火柴人形象的生成，在./punch_photos文件夹下生成一个与用户
+nfc卡片的uuid相同名称的文件夹，在该文件夹下存储用户的打卡火柴人形象的图片(即每个用户对应一个不同的文件夹)
+
+3.使用oss上传用户的打卡形象到服务器参考文档是如下：
+
+"""
+oss 相关
+不同用户的文件名必须不同, 否则会相互覆盖
+建议
+{用户 uuid}_{随机数字}.{文件格式}
+上传后的访问链接为
+https://sensecap-statics.seeed.cn/nfc-trace/makerfaire-2025/文件名
+
+bucket_name: sensecap-statics
+region: cn-shenzhen
+
+access_id: LTAI5tApDmGBq95haRq3EHpL
+access_secret: xW9eRDTf0DH7JcbXEn2B6funlnTaUt
+
+编辑用户名片签到照片
+图片上传成功后, 用来将签到照片链接更新到云端
+PUT https://makerfaire-nfc.seeed.cn/api/v1/cards/{名片 UUID}/avatar
+
+{
+    "avatar_url" :"图片地址"
+}
+"""
+oss sdk python api：https://help.aliyun.com/zh/oss/developer-reference/upload-an-object-using-a-signed-url-generated-with-oss-sdk-for-python-v2?spm=a2c4g.11186623.help-menu-31815.d_1_1_2_1_0_4.9f9f3c8f2LToZq#dddcccc6d4imm
+
+
+
+
+
+4.最后用户离开摄像头重置系统，进行下一位用户的打卡录入！
+
+
+
+以uuid来固定用户身份，如果他拍完照对于照片不满意，就重新生成新的照片，然后上传到oss，更新掉用户的avatar_url！
+这里面的逻辑是：
+用户离开打卡成功离开区域，系统重置，等待下一位用户打卡！
+如果uuid一直没有更新，则说明还是同一位用户，他想重新拍照，则重新摆pose生成新的照片，然后上传到oss，更新掉用户的avatar_url！

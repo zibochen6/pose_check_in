@@ -1,20 +1,15 @@
 import os
-# OpenCV 使用 Qt5 后端（构建时只支持 Qt，不支持 GTK）
-# 需要正确配置 Qt 插件路径，确保 Qt 能找到 xcb 插件
-# 必须在导入 cv2 之前设置环境变量
-
-# 恢复 Qt 插件目录（如果之前被禁用了）
+# 配置 Qt 插件路径，确保 Qt 能找到 xcb 插件
 qt_plugin_path = os.path.expanduser('~/.local/lib/python3.10/site-packages/cv2/qt/plugins')
 qt_plugin_backup = qt_plugin_path + '.disabled'
 if os.path.exists(qt_plugin_backup) and not os.path.exists(qt_plugin_path):
     try:
         os.rename(qt_plugin_backup, qt_plugin_path)
-        print(f"已恢复 Qt 插件目录")
+        # print(f"已恢复 Qt 插件目录")
     except Exception as e:
         print(f"警告：无法恢复 Qt 插件目录: {e}")
 
 # 设置 Qt 插件路径，确保能找到 xcb 插件
-# OpenCV 的 Qt 插件目录
 if os.path.exists(qt_plugin_path):
     # 设置 QT_PLUGIN_PATH 包含 OpenCV 的插件目录和系统 Qt 插件目录
     system_qt_plugins = '/usr/lib/aarch64-linux-gnu/qt5/plugins'
@@ -46,7 +41,7 @@ import mediapipe as mp
 import signal
 import sys
 
-# ============= 新增：全局配置参数 =============
+# 全局配置参数 =============
 # 网络请求超时配置（秒）
 API_TIMEOUT = 30  # API调用超时
 DOWNLOAD_TIMEOUT = 15  # 图片下载超时
@@ -62,9 +57,6 @@ KEEP_GENERATED_IMAGES_COUNT = 10  # 最多保留的生成图片数量（防止�
 
 # GUI 支持
 HAVE_GUI = True
-
-# OpenCV 使用 Qt5 后端（已正确配置 Qt 插件路径）
-print("OpenCV 使用 Qt5 后端运行")
 
 # 加载YOLO姿态估计模型
 model = YOLO(MODEL_PATH, task="pose")  # 使用TensorRT引擎文件

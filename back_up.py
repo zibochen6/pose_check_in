@@ -5,19 +5,9 @@ from ultralytics import YOLO
 import os
 from datetime import datetime
 from config import *
-import mediapipe as mp
 
 # 加载YOLO姿态估计模型
 model = YOLO(MODEL_PATH,task="pose")  # 使用TensorRT引擎文件
-
-# 初始化MediaPipe手部检测
-mp_hands = mp.solutions.hands
-hands_detector = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=2,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
 
 # 加载状态图标
 red_icon = cv2.imread("icon/red.png", cv2.IMREAD_UNCHANGED)
@@ -100,30 +90,15 @@ def blend_icons(red_icon, green_icon, progress):
     
     return blended.astype(np.uint8)
 
-def is_person_in_roi(keypoints, roi_x, roi_y, roi_width, roi_height):
-    """检查人是否在检测区域内"""
-    if len(keypoints) == 0:
-        return False
-    
-    # 检查关键点是否在ROI内
-    valid_keypoints = 0
-    for x, y, conf in keypoints:
-        if conf > 0.6:
-            if roi_x <= x <= roi_x + roi_width and roi_y <= y <= roi_y + roi_height:
-                valid_keypoints += 1
-    
-    # 如果超过一半的关键点在ROI内，认为人在区域内
-    return valid_keypoints > len([k for k in keypoints if k[2] > 0.5]) * 0.5
-
-def calculate_pose_distance(keypoints1, keypoints2, hands_data1=None, hands_data2=None):
-    """计算两个姿态之间的距离（包括身体和手部）"""
+def calculate_pose_distance(keypoints1, keypoints2):
+    """计算两个姿态之间的距离"""
     if keypoints1 is None or keypoints2 is None:
         return float('inf')
     
     total_distance = 0
     valid_points = 0
     
-    # 1. 身体关键点距离计算
+    # 身体关键点距离计算
     important_keypoints = [0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]  # 鼻子、左肩、右肩、左肘、右肘、左腕、右腕、左髋、右髋、左膝、右膝、左踝、右踝
     
     for i in important_keypoints:
@@ -133,28 +108,6 @@ def calculate_pose_distance(keypoints1, keypoints2, hands_data1=None, hands_data
                              (keypoints1[i][1] - keypoints2[i][1])**2)
             total_distance += distance
             valid_points += 1
-    
-    # 2. 手部关键点距离计算
-    if hands_data1 and hands_data2 and len(hands_data1) > 0 and len(hands_data2) > 0:
-        # 尝试匹配相同的手（左手对左手，右手对右手）
-        for hand1 in hands_data1:
-            for hand2 in hands_data2:
-                if hand1['label'] == hand2['label']:  # 相同的手
-                    landmarks1 = hand1['landmarks']
-                    landmarks2 = hand2['landmarks']
-                    
-                    # 只计算关键手部点（手腕、指尖、掌心关键点）
-                    key_hand_points = [0, 4, 8, 12, 16, 20]  # 手腕和5个指尖
-                    
-                    for idx in key_hand_points:
-                        if idx < len(landmarks1) and idx < len(landmarks2):
-                            # 手部坐标是归一化的，需要乘以画面尺寸
-                            dist = np.sqrt(
-                                ((landmarks1[idx][0] - landmarks2[idx][0]) * frame_width)**2 + 
-                                ((landmarks1[idx][1] - landmarks2[idx][1]) * frame_height)**2
-                            )
-                            total_distance += dist
-                            valid_points += 1
     
     return total_distance / valid_points if valid_points > 0 else float('inf')
 
@@ -177,179 +130,10 @@ def enhance_frame_for_dark_lighting(frame):
     
     return enhanced_frame
 
-def get_person_bounding_box_from_detection(results):
-    """从YOLO检测结果中直接获取人的边界框"""
-    if results[0].boxes is None or len(results[0].boxes) == 0:
-        return None
-    
-    # 获取第一个检测到的人的边界框
-    boxes = results[0].boxes.xyxy.cpu().numpy()  # 格式: [x1, y1, x2, y2]
-    
-    if len(boxes) == 0:
-        return None
-    
-    # 取第一个人的边界框
-    x1, y1, x2, y2 = boxes[0]
-    
-    # 添加一些边距
-    margin = 20
-    x_min = max(0, int(x1 - margin))
-    y_min = max(0, int(y1 - margin))
-    x_max = min(frame_width, int(x2 + margin))
-    y_max = min(frame_height, int(y2 + margin))
-    
-    return (x_min, y_min, x_max, y_max)
-
-def detect_hands(image):
-    """使用MediaPipe检测手部关键点"""
-    # 转换为RGB（MediaPipe需要RGB格式）
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = hands_detector.process(image_rgb)
-    
-    hands_data = []
-    if results.multi_hand_landmarks and results.multi_handedness:
-        for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-            # 获取手部类型（左手或右手）
-            hand_label = handedness.classification[0].label  # "Left" or "Right"
-            
-            # 提取21个手部关键点
-            landmarks = []
-            for landmark in hand_landmarks.landmark:
-                landmarks.append([landmark.x, landmark.y, landmark.z])
-            
-            hands_data.append({
-                'label': hand_label,
-                'landmarks': np.array(landmarks)
-            })
-    
-    return hands_data
-
-def draw_stickman_with_hands(keypoints, hands_data, canvas_width=500, canvas_height=700):
-    """根据关键点和手部数据在白色画布上绘制完整的火柴人"""
-    # 先绘制基础火柴人
-    canvas = draw_stickman(keypoints, canvas_width, canvas_height)
-    
-    if not hands_data:
-        return canvas
-    
-    # 找到关键点的边界来进行缩放和居中（与draw_stickman保持一致）
-    valid_points = []
-    for x, y, conf in keypoints:
-        if conf > 0.3:
-            valid_points.append((x, y))
-    
-    if len(valid_points) == 0:
-        return canvas
-    
-    # 计算关键点的边界
-    x_coords = [p[0] for p in valid_points]
-    y_coords = [p[1] for p in valid_points]
-    x_min, x_max = min(x_coords), max(x_coords)
-    y_min, y_max = min(y_coords), max(y_coords)
-    
-    # 计算缩放比例，保持纵横比
-    person_width = x_max - x_min
-    person_height = y_max - y_min
-    
-    scale_x = (canvas_width * 0.7) / person_width if person_width > 0 else 1
-    scale_y = (canvas_height * 0.7) / person_height if person_height > 0 else 1
-    scale = min(scale_x, scale_y)
-    
-    # 计算偏移，使火柴人居中
-    offset_x = (canvas_width - person_width * scale) / 2 - x_min * scale
-    offset_y = (canvas_height - person_height * scale) / 2 - y_min * scale
-    
-    # 转换手部关键点坐标到画布坐标
-    def transform_hand_point(x, y):
-        # 手部坐标是归一化的(0-1)，需要转换到画布坐标系统
-        new_x = int(x * frame_width * scale + offset_x)
-        new_y = int(y * frame_height * scale + offset_y)
-        return (new_x, new_y)
-    
-    # MediaPipe手部关键点连接关系
-    hand_connections = [
-        # 拇指
-        [0, 1], [1, 2], [2, 3], [3, 4],
-        # 食指
-        [0, 5], [5, 6], [6, 7], [7, 8],
-        # 中指
-        [0, 9], [9, 10], [10, 11], [11, 12],
-        # 无名指
-        [0, 13], [13, 14], [14, 15], [15, 16],
-        # 小指
-        [0, 17], [17, 18], [18, 19], [19, 20],
-        # 手掌
-        [5, 9], [9, 13], [13, 17]
-    ]
-    
-    # 定义颜色方案（与身体一致）
-    body_color = (50, 50, 50)  # 深灰色（与身体骨架一致）
-    joint_color = (100, 150, 255)  # 浅蓝色关节（与身体关节一致）
-    
-    # 定义手指线条粗细
-    finger_thickness = {
-        'palm': 4,        # 手掌主线
-        'thumb': 3,       # 拇指
-        'finger': 3,      # 其他手指
-        'connection': 4   # 手掌连接线
-    }
-    
-    for hand in hands_data:
-        landmarks = hand['landmarks']
-        
-        # 首先绘制手掌连接线（更粗）
-        palm_connections = [[5, 9], [9, 13], [13, 17], [0, 5], [0, 17]]
-        for connection in palm_connections:
-            pt1_idx, pt2_idx = connection
-            if pt1_idx < len(landmarks) and pt2_idx < len(landmarks):
-                pt1 = transform_hand_point(landmarks[pt1_idx][0], landmarks[pt1_idx][1])
-                pt2 = transform_hand_point(landmarks[pt2_idx][0], landmarks[pt2_idx][1])
-                
-                if (0 <= pt1[0] < canvas_width and 0 <= pt1[1] < canvas_height and
-                    0 <= pt2[0] < canvas_width and 0 <= pt2[1] < canvas_height):
-                    cv2.line(canvas, pt1, pt2, body_color, finger_thickness['palm'])
-        
-        # 绘制五根手指（分别设置粗细）
-        finger_groups = [
-            ([0, 1, 2, 3, 4], finger_thickness['thumb']),     # 拇指
-            ([5, 6, 7, 8], finger_thickness['finger']),        # 食指
-            ([9, 10, 11, 12], finger_thickness['finger']),     # 中指
-            ([13, 14, 15, 16], finger_thickness['finger']),    # 无名指
-            ([17, 18, 19, 20], finger_thickness['finger'])     # 小指
-        ]
-        
-        for finger, thickness in finger_groups:
-            for i in range(len(finger) - 1):
-                pt1_idx = finger[i]
-                pt2_idx = finger[i + 1]
-                if pt1_idx < len(landmarks) and pt2_idx < len(landmarks):
-                    pt1 = transform_hand_point(landmarks[pt1_idx][0], landmarks[pt1_idx][1])
-                    pt2 = transform_hand_point(landmarks[pt2_idx][0], landmarks[pt2_idx][1])
-                    
-                    if (0 <= pt1[0] < canvas_width and 0 <= pt1[1] < canvas_height and
-                        0 <= pt2[0] < canvas_width and 0 <= pt2[1] < canvas_height):
-                        cv2.line(canvas, pt1, pt2, body_color, thickness)
-        
-        # 绘制手部关节点（与身体关节风格一致）
-        important_joints = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-        for i in important_joints:
-            if i < len(landmarks):
-                pt = transform_hand_point(landmarks[i][0], landmarks[i][1])
-                if 0 <= pt[0] < canvas_width and 0 <= pt[1] < canvas_height:
-                    # 手腕和指尖稍大，其他关节较小
-                    if i in [0, 4, 8, 12, 16, 20]:  # 手腕和5个指尖
-                        radius = 6
-                    else:  # 其他关节
-                        radius = 5
-                    cv2.circle(canvas, pt, radius, joint_color, -1)
-                    cv2.circle(canvas, pt, radius, body_color, 2)
-    
-    return canvas
-
 def draw_stickman(keypoints, canvas_width=500, canvas_height=700):
-    """根据关键点在白色画布上绘制美观的火柴人"""
-    # 创建白色画布
-    canvas = np.ones((canvas_height, canvas_width, 3), dtype=np.uint8) * 255
+    """根据关键点在透明画布上绘制美观的火柴人"""
+    # 先创建白色画布（RGB格式）用于绘制
+    canvas_rgb = np.ones((canvas_height, canvas_width, 3), dtype=np.uint8) * 255
     
     # 找到关键点的边界来进行缩放和居中
     valid_points = []
@@ -358,7 +142,9 @@ def draw_stickman(keypoints, canvas_width=500, canvas_height=700):
             valid_points.append((x, y))
     
     if len(valid_points) == 0:
-        return canvas
+        # 返回透明画布
+        canvas_rgba = np.zeros((canvas_height, canvas_width, 4), dtype=np.uint8)
+        return canvas_rgba
     
     # 计算关键点的边界
     x_coords = [p[0] for p in valid_points]
@@ -384,7 +170,7 @@ def draw_stickman(keypoints, canvas_width=500, canvas_height=700):
         new_y = int(y * scale + offset_y)
         return (new_x, new_y)
     
-    # 定义身体各部分的线条粗细和颜色
+    # 定义身体各部分的线条粗细和颜色（RGB格式）
     body_color = (50, 50, 50)  # 深灰色
     joint_color = (100, 150, 255)  # 浅蓝色关节
     head_color = (255, 200, 150)  # 肤色头部
@@ -416,13 +202,13 @@ def draw_stickman(keypoints, canvas_width=500, canvas_height=700):
     # 2. 绘制脖子（从肩膀中点到头部底部）
     if head_center is not None and neck_bottom is not None:
         neck_top = (head_center[0], head_center[1] + head_radius)
-        cv2.line(canvas, neck_bottom, neck_top, body_color, 5)
+        cv2.line(canvas_rgb, neck_bottom, neck_top, body_color, 5)
     
     # 3. 绘制头部（简单的圆球，在脖子上方）
     if head_center is not None:
         # 绘制头部轮廓 - 只是一个简单的圆球
-        cv2.circle(canvas, head_center, head_radius, head_color, -1)
-        cv2.circle(canvas, head_center, head_radius, body_color, 2)
+        cv2.circle(canvas_rgb, head_center, head_radius, head_color, -1)
+        cv2.circle(canvas_rgb, head_center, head_radius, body_color, 2)
     
     # 3. 绘制躯干和四肢骨架（粗线条）
     thickness_map = {
@@ -465,73 +251,104 @@ def draw_stickman(keypoints, canvas_width=500, canvas_height=700):
             keypoints[pt1_idx][2] > 0.3 and keypoints[pt2_idx][2] > 0.3):
             pt1 = transform_point(keypoints[pt1_idx][0], keypoints[pt1_idx][1])
             pt2 = transform_point(keypoints[pt2_idx][0], keypoints[pt2_idx][1])
-            cv2.line(canvas, pt1, pt2, body_color, thickness)
+            cv2.line(canvas_rgb, pt1, pt2, body_color, thickness)
     
     # 4. 绘制关节点（较大的圆圈）
     important_joints = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     for i in important_joints:
         if i < len(keypoints) and keypoints[i][2] > 0.3:
             pt = transform_point(keypoints[i][0], keypoints[i][1])
-            cv2.circle(canvas, pt, 8, joint_color, -1)
-            cv2.circle(canvas, pt, 8, body_color, 2)
+            cv2.circle(canvas_rgb, pt, 8, joint_color, -1)
+            cv2.circle(canvas_rgb, pt, 8, body_color, 2)
+    
+    # 将白色背景转换为透明背景
+    # 创建RGBA画布
+    canvas_rgba = np.zeros((canvas_height, canvas_width, 4), dtype=np.uint8)
+    
+    # 复制RGB通道
+    canvas_rgba[:, :, :3] = canvas_rgb
+    
+    # 设置Alpha通道：白色背景(255,255,255)变为透明，其他区域不透明
+    # 计算每个像素与白色的差异
+    white = np.array([255, 255, 255], dtype=np.uint8)
+    diff = np.sum(np.abs(canvas_rgb.astype(np.int16) - white), axis=2)
+    
+    # 如果像素接近白色（差异小于阈值），设为透明；否则设为不透明
+    threshold = 10  # 阈值，允许一些误差
+    canvas_rgba[:, :, 3] = np.where(diff < threshold, 0, 255).astype(np.uint8)
+    
+    return canvas_rgba
+
+def save_stickman_image(stickman_canvas, save_dir="punch_photos"):
+    """保存火柴人图片到本地"""
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    
+    # 生成带时间戳的文件名
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"stickman_{timestamp}.png"
+    filepath = os.path.join(save_dir, filename)
+    
+    # 保存图片
+    cv2.imwrite(filepath, stickman_canvas)
+    print(f"火柴人图片已保存: {filepath}")
+    return filepath
+
+def create_split_screen(left_frame, right_stickman, canvas_width=1280, canvas_height=720):
+    """创建左右分屏画布"""
+    # 左边画面宽度，右边火柴人宽度
+    left_width = int(canvas_width * 0.6)  # 左边占60%
+    right_width = canvas_width - left_width  # 右边占40%
+    
+    # 创建画布
+    canvas = np.ones((canvas_height, canvas_width, 3), dtype=np.uint8) * 255
+    
+    # 调整左边摄像头画面大小
+    left_resized = cv2.resize(left_frame, (left_width, canvas_height))
+    
+    # 调整右边火柴人大小（保持纵横比）
+    stickman_h, stickman_w = right_stickman.shape[:2]
+    scale = min(right_width / stickman_w, canvas_height / stickman_h) * 0.9  # 留一些边距
+    new_w = int(stickman_w * scale)
+    new_h = int(stickman_h * scale)
+    right_resized = cv2.resize(right_stickman, (new_w, new_h))
+    
+    # 将火柴人居中放置在右边区域
+    y_offset = (canvas_height - new_h) // 2
+    x_offset = left_width + (right_width - new_w) // 2
+    
+    # 将左边画面放到画布
+    canvas[:, :left_width] = left_resized
+    
+    # 将右边火柴人放到画布（处理透明背景）
+    if right_resized.shape[2] == 4:  # RGBA格式
+        # 提取RGB和Alpha通道
+        stickman_rgb = right_resized[:, :, :3]
+        stickman_alpha = right_resized[:, :, 3] / 255.0
+        
+        # 获取画布中对应的区域
+        bg_region = canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w]
+        
+        # Alpha混合
+        for c in range(3):
+            bg_region[:, :, c] = (stickman_alpha * stickman_rgb[:, :, c] + 
+                                  (1 - stickman_alpha) * bg_region[:, :, c]).astype(np.uint8)
+        
+        canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = bg_region
+    else:  # RGB格式（向后兼容）
+        canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = right_resized
+    
+    # 绘制中间分隔线
+    cv2.line(canvas, (left_width, 0), (left_width, canvas_height), (200, 200, 200), 2)
     
     return canvas
 
-def show_photo_and_stickman(frame, person_bbox, current_keypoints):
-    """显示拍照的照片和火柴人形象"""
-    if person_bbox is None:
-        print("无法获取人的检测框")
-        return
-    
-    x_min, y_min, x_max, y_max = person_bbox
-    
-    # 裁剪人的区域
-    cropped_person = frame[y_min:y_max, x_min:x_max]
-    
-    if cropped_person.size == 0:
-        print("检测框区域无效")
-        return
-    
-    # 直接使用当前检测到的关键点（更准确）
-    print("正在生成火柴人...")
-    if current_keypoints is not None and len(current_keypoints) > 0:
-        # 检测手部关键点
-        print("正在检测手部...")
-        hands_data = detect_hands(frame)
-        
-        if hands_data:
-            print(f"检测到 {len(hands_data)} 只手")
-            for hand in hands_data:
-                print(f"  - {hand['label']} 手")
-        else:
-            print("未检测到手部，将绘制基础火柴人")
-        
-        # 绘制带手部的完整火柴人
-        stickman_canvas = draw_stickman_with_hands(current_keypoints, hands_data)
-        
-        # 显示火柴人窗口
-        cv2.namedWindow("Stickman - Punch Pose", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Stickman - Punch Pose", 500, 700)
-        cv2.imshow("Stickman - Punch Pose", stickman_canvas)
-        
-        print("打卡成功！")
-        
-        # 打印关键点信息用于调试
-        print(f"关键点数量: {len(current_keypoints)}")
-        for i, (x, y, conf) in enumerate(current_keypoints):
-            if i < 5:  # 只打印前5个（头部相关）
-                print(f"关键点{i}: 置信度={conf:.2f}")
-    else:
-        print("无法获取关键点数据")
-    
-    # 也显示原始照片
-    cv2.namedWindow("Punch Photo", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Punch Photo", 600, 800)
-    cv2.imshow("Punch Photo", cropped_person)
-
 print("姿态打卡系统初始化...")
-print("请进入检测区域并保持pose 3秒进行打卡")
+print("请进入摄像头画面并保持pose 3秒进行打卡")
 print("按 'q' 键退出程序")
+
+# 初始化变量
+frozen_stickman = None  # 用于存储打卡成功后固定的火柴人图像
 
 while True:
     ret, frame = cap.read()
@@ -540,23 +357,12 @@ while True:
         print("无法读取摄像头画面")
         break
     
-    # 计算FPS
-    
-
-    # 优化暗光环境下的画面质量
-    enhanced_frame = enhance_frame_for_dark_lighting(frame)
-    
+    # 计算FPS    
     # 进行姿态估计推理（使用增强后的画面）
-    results = model(enhanced_frame, verbose=False)
+    results = model(frame, verbose=False)
     
     # 创建显示帧（带可视化）
     display_frame = frame.copy()
-    
-    # 绘制ROI区域
-    cv2.rectangle(display_frame, (roi_x, roi_y), 
-                  (roi_x + roi_width, roi_y + roi_height), (0, 255, 255), 2)
-    # cv2.putText(display_frame, "Detection Area", (roi_x, roi_y - 10), 
-    #             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     
     # 绘制YOLO姿态检测结果（根据配置决定是否显示）
     if show_detection_results and results[0].keypoints is not None:
@@ -591,72 +397,58 @@ while True:
             person_keypoints = keypoints[0]
             current_keypoints = person_keypoints
             
-            # 检查人是否在ROI内
-            if is_person_in_roi(person_keypoints, roi_x, roi_y, roi_width, roi_height):
-                
-                #还没人进入打卡区域
-                if punch_state == "waiting":
-                    punch_state = "detecting"
-                    # print("检测到人员进入打卡区域")
-                #已经有人在打卡区域
-                elif punch_state == "detecting":
-                    punch_state = "posing"
-                    pose_start_time = time.time()
-                    last_pose_keypoints = person_keypoints.copy()
-                    # 保存当前手部数据
-                    last_hands_data = detect_hands(frame)
-                    # print("开始检测pose，请保持姿态3秒...")
+            #还没人进入打卡区域
+            if punch_state == "waiting":
+                punch_state = "detecting"
+                # print("检测到人员进入画面")
+            #已经有人在打卡区域
+            elif punch_state == "detecting":
+                punch_state = "posing"
+                pose_start_time = time.time()
+                last_pose_keypoints = person_keypoints.copy()
+                # print("开始检测pose，请保持姿态3秒...")
 
-                #已经摆pose了，开始检测pose是否稳定
-                elif punch_state == "posing":
-                    # 获取当前手部数据
-                    current_hands = detect_hands(frame)
-                    
-                    # 检查姿态是否稳定（包括身体和手部）
-                    pose_distance = calculate_pose_distance(person_keypoints, last_pose_keypoints, current_hands, last_hands_data)
-                    current_time = time.time()
-                    elapsed_time = current_time - pose_start_time
-                    
-                    # 显示当前姿态距离用于调试
-                    # cv2.putText(display_frame, f"Pose Distance: {pose_distance:.1f}", 
-                    #           (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    
-                    if pose_distance < pose_stable_threshold:
-                        # 姿态稳定，更新计时
-                        remaining_time = pose_duration - elapsed_time
-                        
-                        if remaining_time <= 0:
-                            # 时间到，拍照
-                            punch_state = "capturing"
-                            person_bbox = get_person_bounding_box_from_detection(results)
-                            show_photo_and_stickman(frame, person_bbox, person_keypoints)  # 显示原始照片和火柴人
-                            punch_state = "success"
-                            print("打卡完成！")
-                        else:
-                            # 显示倒计时
-                            cv2.putText(display_frame, f"Hold pose: {remaining_time:.1f}s", 
-                                      (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                            # 更新参考姿态（允许轻微移动）
-                            last_pose_keypoints = person_keypoints.copy()
-                            last_hands_data = current_hands
-                    else:
-                        # 姿态不稳定，重新开始
-                        punch_state = "detecting"
-                        pose_start_time = None
-                        print(f"姿态不稳定，距离: {pose_distance:.1f}，阈值: {pose_stable_threshold}")
+            #已经摆pose了，开始检测pose是否稳定
+            elif punch_state == "posing":
+                # 检查姿态是否稳定
+                pose_distance = calculate_pose_distance(person_keypoints, last_pose_keypoints)
+                current_time = time.time()
+                elapsed_time = current_time - pose_start_time
                 
-                elif punch_state == "success":
-                    # 成功状态，等待重置
-                    cv2.putText(display_frame, "Punch Success!", (10, 100), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    cv2.putText(display_frame, "Move away to reset", (10, 140), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-            else:
-                # 人不在ROI内，重置状态
-                if punch_state != "waiting":
-                    punch_state = "waiting"
+                # 显示当前姿态距离用于调试
+                # cv2.putText(display_frame, f"Pose Distance: {pose_distance:.1f}", 
+                #           (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                if pose_distance < pose_stable_threshold:
+                    # 姿态稳定，更新计时
+                    remaining_time = pose_duration - elapsed_time
+                    
+                    if remaining_time <= 0:
+                        # 时间到，打卡成功
+                        punch_state = "success"
+                        # 生成并固定火柴人图像
+                        frozen_stickman = draw_stickman(person_keypoints)
+                        # 保存火柴人图片
+                        save_stickman_image(frozen_stickman)
+                        print("打卡完成！")
+                    else:
+                        # 显示倒计时
+                        cv2.putText(display_frame, f"Hold pose: {remaining_time:.1f}s", 
+                                  (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                        # 更新参考姿态（允许轻微移动）
+                        last_pose_keypoints = person_keypoints.copy()
+                else:
+                    # 姿态不稳定，重新开始
+                    punch_state = "detecting"
                     pose_start_time = None
-                    print("请进入检测区域")
+                    print(f"姿态不稳定，距离: {pose_distance:.1f}，阈值: {pose_stable_threshold}")
+            
+            elif punch_state == "success":
+                # 成功状态，等待重置
+                cv2.putText(display_frame, "Punch Success!", (10, 100), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                cv2.putText(display_frame, "Move away to reset", (10, 140), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         
         elif num_people > 1:
             # 多个人的情况
@@ -675,62 +467,16 @@ while True:
         
         else:
             # 没有人，重置状态
-            if punch_state != "waiting":
+            if punch_state == "success":
+                # 打卡成功后，人离开则重置整个系统
+                punch_state = "waiting"
+                pose_start_time = None
+                frozen_stickman = None  # 重置固定的火柴人
+                print("系统已重置，等待下一位用户")
+            elif punch_state != "waiting":
                 punch_state = "waiting"
                 pose_start_time = None
                 print("区域内无人，系统已重置")
-    
-    # 实时检测手部并在主窗口显示（根据配置决定是否显示）
-    hands_data = detect_hands(frame)
-    if show_detection_results and hands_data:
-        # 绘制手部检测结果
-        for hand in hands_data:
-            landmarks = hand['landmarks']
-            hand_label = hand['label']
-            
-            # 将归一化坐标转换为像素坐标
-            h, w = frame.shape[:2]
-            
-            # 定义手部连接关系
-            hand_connections = [
-                # 拇指
-                [0, 1], [1, 2], [2, 3], [3, 4],
-                # 食指
-                [0, 5], [5, 6], [6, 7], [7, 8],
-                # 中指
-                [0, 9], [9, 10], [10, 11], [11, 12],
-                # 无名指
-                [0, 13], [13, 14], [14, 15], [15, 16],
-                # 小指
-                [0, 17], [17, 18], [18, 19], [19, 20],
-                # 手掌
-                [5, 9], [9, 13], [13, 17]
-            ]
-            
-            # 绘制手部骨架连接线
-            for connection in hand_connections:
-                pt1_idx, pt2_idx = connection
-                if pt1_idx < len(landmarks) and pt2_idx < len(landmarks):
-                    pt1 = (int(landmarks[pt1_idx][0] * w), int(landmarks[pt1_idx][1] * h))
-                    pt2 = (int(landmarks[pt2_idx][0] * w), int(landmarks[pt2_idx][1] * h))
-                    cv2.line(display_frame, pt1, pt2, (0, 255, 0), 2)
-            
-            # 绘制手部关键点
-            for i, landmark in enumerate(landmarks):
-                x = int(landmark[0] * w)
-                y = int(landmark[1] * h)
-                # 手腕和指尖用不同颜色和大小
-                if i in [0, 4, 8, 12, 16, 20]:  # 手腕和指尖
-                    cv2.circle(display_frame, (x, y), 6, (255, 0, 0), -1)
-                else:
-                    cv2.circle(display_frame, (x, y), 4, (0, 255, 255), -1)
-            
-            # 在手腕位置显示手的标签
-            if len(landmarks) > 0:
-                wrist_x = int(landmarks[0][0] * w)
-                wrist_y = int(landmarks[0][1] * h)
-                cv2.putText(display_frame, f"{hand_label} Hand", (wrist_x - 30, wrist_y - 20), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
     
     # 显示状态信息
     status_text = {
@@ -744,8 +490,8 @@ while True:
     fps = 1 / (c_time - p_time)
     p_time = c_time
     # 显示FPS（左上角）
-    # cv2.putText(display_frame, f"FPS: {fps:.1f}", 
-    #           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(display_frame, f"FPS: {fps:.1f}", 
+              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     
     # 显示状态（FPS下方）
     cv2.putText(display_frame, f"Status: {status_text.get(punch_state, 'Unknown')}", 
@@ -755,11 +501,6 @@ while True:
     # num_people = len(keypoints) if results[0].keypoints is not None else 0
     # cv2.putText(display_frame, f"People: {num_people}", (10, 60), 
     #           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    
-    # 显示检测到的手数
-    # num_hands = len(hands_data) if hands_data else 0
-    # cv2.putText(display_frame, f"Hands: {num_hands}", (10, 90), 
-    #           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
     
     # 在右上角显示状态图标
     icon_size = 80  # 图标大小
@@ -798,8 +539,29 @@ while True:
     # 叠加图标到画面
     display_frame = overlay_icon_with_alpha(display_frame, resized_icon, icon_x, icon_y, alpha=0.9)
     
+    # 生成右边的火柴人画面
+    if punch_state == "success" and frozen_stickman is not None:
+        # 打卡成功后，显示固定的火柴人（保持透明背景）
+        right_stickman = frozen_stickman.copy()
+        # 在火柴人上添加"打卡成功"文字
+        cv2.putText(right_stickman, "Punch Success!", 
+                   (right_stickman.shape[1]//2 - 150, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 0), 3)
+    elif current_keypoints is not None and len(current_keypoints) > 0:
+        # 实时显示火柴人（透明背景）
+        right_stickman = draw_stickman(current_keypoints)
+    else:
+        # 没有检测到人，显示空白画布和提示
+        right_stickman = np.ones((700, 500, 3), dtype=np.uint8) * 255
+        cv2.putText(right_stickman, "Waiting for pose...", 
+                   (right_stickman.shape[1]//2 - 140, right_stickman.shape[0]//2), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (150, 150, 150), 2)
+    
+    # 创建左右分屏画面
+    split_screen = create_split_screen(display_frame, right_stickman)
+    
     # 显示画面
-    cv2.imshow("Punch Clock System", display_frame)
+    cv2.imshow("Punch Clock System", split_screen)
     
     # 按'q'键退出
     if cv2.waitKey(1) & 0xFF == ord('q'):

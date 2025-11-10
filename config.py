@@ -3,6 +3,28 @@
 MODEL_PATH = "models/yolo11m-pose.engine"
 camera_index = 0
 
+
+
+# 全局配置参数 =============
+# 网络请求超时配置（秒）
+API_TIMEOUT = 30  # API调用超时
+DOWNLOAD_TIMEOUT = 15  # 图片下载超时
+MAX_API_RETRIES = 2  # API失败最大重试次数
+
+# 摄像头重连配置
+CAMERA_RECONNECT_DELAY = 2  # 重连延迟（秒）
+CAMERA_RECONNECT_MAX_ATTEMPTS = 10  # 最大重连次数
+CAMERA_READ_TIMEOUT = 3  # 读取超时（秒）
+
+# 资源管理
+KEEP_GENERATED_IMAGES_COUNT = 10  # 最多保留的生成图片数量（防止磁盘占满）
+
+# GUI 支持
+HAVE_GUI = True
+#摄像头断开计数器
+camera_fail_count = 0
+MAX_CAMERA_FAIL_COUNT = 5
+
 # 显示选项
 show_detection_results = False  # True: 显示姿态检测结果, False: 不显示检测结果
 
